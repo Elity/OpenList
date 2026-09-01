@@ -432,21 +432,34 @@ func TestBudgetExhaustionStopsDeletingButNotWriting(t *testing.T) {
 }
 
 // A removal that could not happen destroyed nothing, so it must not consume the
-// allowance.
-func TestFailedRemovalsAreRefundedToTheBudget(t *testing.T) {
+// allowance. Otherwise one directory the process cannot write to burns the
+// budget on every pass, and the library eventually stops being written at all.
+//
+// This goes through deleteExtra rather than calling refundDeleteBudget itself:
+// asserting on the helper in isolation passes even if nothing ever calls it.
+func TestABlockedRemovalDoesNotSpendTheBudget(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so no removal would fail")
+	}
 	d, cfg := syncDriver(t)
-	d.deleteBudget.Store(5)
+	root := seedLocal(t, []string{"stale.strm"}, nil)
 
-	root := seedLocal(t, nil, []string{"NotEmpty"})
-	if err := os.WriteFile(filepath.Join(root, "NotEmpty", "keep.nfo"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("seed nested file: %v", err)
+	// A file can only be unlinked if its *directory* is writable.
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
 	}
-	if failed := d.removeEntries(root, nil, []string{"NotEmpty"}); failed != 1 {
-		t.Fatalf("removeEntries() failed = %d, want 1", failed)
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	before := d.deleteBudget.Load()
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
 	}
-	d.refundDeleteBudget(cfg, 1)
-	if got := d.deleteBudget.Load(); got != 6 {
-		t.Errorf("budget = %d, want 6 after a refund", got)
+
+	if _, err := os.Stat(filepath.Join(root, "stale.strm")); err != nil {
+		t.Fatalf("the removal succeeded after all, so this test proves nothing: %v", err)
+	}
+	if got := d.deleteBudget.Load(); got != before {
+		t.Errorf("budget = %d, want %d: a removal that failed was still charged", got, before)
 	}
 }
 
