@@ -85,12 +85,27 @@ func (c *scanConfig) listPaths(ctx context.Context, path string, refresh bool) (
 		reqPath := stdpath.Join(dst, sub)
 		tmp, err := fs.List(ctx, reqPath, args)
 		if err != nil {
-			failed++
+			if countsAsSourceFailure(err) {
+				failed++
+			}
 			continue
 		}
 		objs = append(objs, c.convert2strmObjs(ctx, reqPath, tmp)...)
 	}
 	return objs, failed, nil
+}
+
+// countsAsSourceFailure reports whether a listing error means the source could
+// not answer, rather than simply not having the path.
+//
+// The distinction matters because the answer decides what gets deleted from
+// disk. Merging several sources under one key is exactly what pathMap's slice
+// is for, and only one of them needs to hold any given subdirectory, so an
+// absent object is ordinary. Anything else -- rate limiting, a revoked token, a
+// storage that is down or gone -- must be counted, or the deletion pass reads
+// it as "the file is gone".
+func countsAsSourceFailure(err error) bool {
+	return err != nil && !errs.IsObjectNotFound(err)
 }
 
 // convert2strmObjs turns a source listing into the objects this driver exposes:

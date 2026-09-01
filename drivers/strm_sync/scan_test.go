@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/cron"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
@@ -470,8 +473,16 @@ func strmObj(name, sourcePath string) model.Obj {
 	return &model.Object{ID: "strm", Name: name, Path: sourcePath, IsFolder: false}
 }
 
-func TestWriteLocalWritesTheSameBodyGetLinkProduces(t *testing.T) {
-	d, cfg := syncDriver(t, func(a *Addition) { a.LocalMode = LocalModeUpdate })
+// The body is asserted against a literal, not against a fresh getLink call:
+// comparing the file to the very function that wrote it is what let every
+// mutation of the URL format survive for so long. What this test is really for
+// is the path mapping and the wiring between writeLocal and writeStrm.
+func TestWriteLocalWritesToTheMirroredPath(t *testing.T) {
+	d, cfg := syncDriver(t, func(a *Addition) {
+		a.LocalMode = LocalModeUpdate
+		a.EncodePath = true
+		a.PathPrefix = "/d"
+	})
 
 	obj := strmObj("Some Film.strm", "/aliyun/Movies/Some Film/Some Film.mkv")
 	if err := d.writeLocalAt(context.Background(), cfg, "/Movies/Some Film", []model.Obj{obj}); err != nil {
@@ -483,7 +494,7 @@ func TestWriteLocalWritesTheSameBodyGetLinkProduces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read written strm: %v", err)
 	}
-	want := cfg.getLink(context.Background(), obj.GetPath())
+	want := "https://pan.example.com/d/aliyun/Movies/Some%20Film/Some%20Film.mkv"
 	if string(body) != want {
 		t.Fatalf("strm body = %q, want %q", body, want)
 	}
@@ -686,18 +697,23 @@ func TestWalkSkipsChildrenWithUnusableNames(t *testing.T) {
 func TestWalkStopsWhenTheContextIsCancelled(t *testing.T) {
 	d, cfg := newWalkDriver(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Counting the calls is the point. Asserting only on the returned error
+	// passes even with every check in walk deleted, because writeLocal has one
+	// of its own and the three shadow each other.
+	calls := 0
 	list := func(ctx context.Context, mountPath string) ([]model.Obj, error) {
-		cancel()
-		return remoteObjs(nil, []string{"child"}), nil
+		calls++
+		return remoteObjs(nil, []string{"a", "b"}), nil
 	}
 
 	st := &scanStats{}
-	err := d.walk(ctx, cfg, "/", 0, list, nil, st)
-	if !errors.Is(err, context.Canceled) {
+	if err := d.walk(ctx, cfg, "/", 0, list, nil, st); !errors.Is(err, context.Canceled) {
 		t.Fatalf("walk() error = %v, want context.Canceled", err)
 	}
-	if st.scannedDirs != 1 {
-		t.Fatalf("scannedDirs = %d, want 1: the walk should stop at once", st.scannedDirs)
+	if calls != 0 {
+		t.Errorf("the source was listed %d times on an already-cancelled pass, want 0", calls)
 	}
 }
 
@@ -1076,23 +1092,64 @@ func TestOrphanPruneStopsAtTheDepthLimit(t *testing.T) {
 // The flat part of a deletion is one ReadDir and a capped batch, but the prune
 // recurses over whatever is on disk, so it is the part that has to notice a
 // cancelled pass rather than run to completion after Drop.
+//
+// The cancellation has to land *during* the prune. Cancelling up front only
+// exercises the guard at the top of deleteExtra, which is a different line: the
+// earlier version of this test did exactly that and passed with planOrphan's
+// own check deleted outright.
 func TestOrphanPruneStopsWhenTheContextIsCancelled(t *testing.T) {
 	d, cfg := syncDriver(t)
-	root := seedLocal(t, []string{"Gone/Movie.strm"}, []string{"Gone"})
+
+	// Wide enough that the walk is still going when the deadline lands.
+	var files, dirs []string
+	for _, name := range names("gone", 40, "") {
+		dirs = append(dirs, name)
+		for _, f := range names("ep", 20, ".strm") {
+			files = append(files, name+"/"+f)
+		}
+	}
+	root := seedLocal(t, files, dirs)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	cancelled := &cancelOnRead{dir: filepath.Join(root, dirs[0]), cancel: cancel}
+	cancelled.arm(t)
 
-	err := d.deleteExtraAt(ctx, cfg, root, remoteObjs([]string{"anchor.strm"}, nil))
+	err := d.deleteExtra(ctx, cfg, root, remoteObjs([]string{"anchor.strm"}, nil), true)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("deleteExtra() error = %v, want context.Canceled", err)
 	}
-	if _, err := os.Lstat(filepath.Join(root, "Gone/Movie.strm")); err != nil {
-		t.Errorf("a cancelled prune should not have deleted anything: %v", err)
-	}
+	// Planning deletes nothing, so nothing may be gone regardless of where it
+	// stopped -- and it must have stopped, not finished.
 	if got := d.filesDeleted.Load(); got != 0 {
-		t.Errorf("filesDeleted = %d, want 0", got)
+		t.Errorf("filesDeleted = %d, want 0: a cancelled prune must not delete", got)
 	}
+	for _, rel := range files {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err != nil {
+			t.Fatalf("%s was removed by a cancelled pass: %v", rel, err)
+		}
+	}
+}
+
+// cancelOnRead trips the context the moment the prune reaches a chosen
+// directory, so the cancellation lands mid-walk rather than before it starts.
+type cancelOnRead struct {
+	dir    string
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnRead) arm(t *testing.T) {
+	t.Helper()
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(c.dir); err == nil {
+				c.cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		c.cancel()
+	}()
 }
 
 // --- getLink ---------------------------------------------------------------
@@ -1335,9 +1392,11 @@ func TestStartScanStopsThePreviousScheduler(t *testing.T) {
 	}
 }
 
-// Init is the real entry point, and it has to be safe to call twice in a row on
-// the same pointer -- which is exactly what UpdateStorage does.
-func TestInitTwiceLeavesOneScheduler(t *testing.T) {
+// Init is the real entry point. Nothing else in the suite observes that it
+// publishes a snapshot or starts a scheduler, or that Drop stops one -- all
+// three could be deleted from the driver and the rest of these tests would not
+// notice.
+func TestInitStartsAndDropStopsTheScheduler(t *testing.T) {
 	d := &StrmSync{}
 	d.Storage.MountPath = "/mnt"
 	d.Addition = Addition{
@@ -1347,17 +1406,79 @@ func TestInitTwiceLeavesOneScheduler(t *testing.T) {
 		LocalMode:           LocalModeUpdate,
 		ScanIntervalMinutes: 1,
 	}
+
+	handles := func() (*cron.Cron, context.CancelFunc) {
+		d.scanMu.Lock()
+		defer d.scanMu.Unlock()
+		return d.cron, d.scanCancel
+	}
+
 	for i := 0; i < 2; i++ {
 		if err := d.Init(context.Background()); err != nil {
 			t.Fatalf("Init() #%d error = %v", i, err)
 		}
+		if d.cfg.Load() == nil {
+			t.Fatalf("Init() #%d published no configuration snapshot; every request would report an uninitialised storage", i)
+		}
+		c, cancel := handles()
+		if c == nil {
+			t.Fatalf("Init() #%d installed no cron, so the scheduled scan would never run", i)
+		}
+		if cancel == nil {
+			t.Fatalf("Init() #%d installed no cancel handle, so Drop could not stop the pass", i)
+		}
 	}
+
 	if err := d.Drop(context.Background()); err != nil {
 		t.Fatalf("Drop() error = %v", err)
+	}
+	if c, cancel := handles(); c != nil || cancel != nil {
+		t.Errorf("Drop() left cron=%v cancel!=nil=%v; a disabled storage would keep writing", c != nil, cancel != nil)
 	}
 	// A second Drop must not panic on the already-stopped cron.
 	if err := d.Drop(context.Background()); err != nil {
 		t.Fatalf("second Drop() error = %v", err)
+	}
+}
+
+// The cron is only installed when an interval is configured, and stopping it is
+// what makes a disabled storage actually stop.
+func TestStartScanInstallsACronOnlyWhenAnIntervalIsSet(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval int
+		wantCron bool
+	}{
+		{name: "no interval", interval: 0, wantCron: false},
+		{name: "one minute", interval: 1, wantCron: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, cfg := syncDriver(t, func(a *Addition) { a.ScanIntervalMinutes = tc.interval })
+			d.startScan(cfg)
+
+			d.scanMu.Lock()
+			got := d.cron != nil
+			d.scanMu.Unlock()
+			if got != tc.wantCron {
+				t.Fatalf("cron installed = %v, want %v", got, tc.wantCron)
+			}
+
+			d.stopScan()
+			d.scanMu.Lock()
+			left := d.cron
+			d.scanMu.Unlock()
+			if left != nil {
+				t.Error("stopScan left the cron handle in place")
+			}
+			d.stopScan() // must not panic on an already-stopped cron
+
+			// Not asserted here: that stopScan actually calls c.Stop(). It
+			// cancels the context first, so a cron goroutine that outlived the
+			// call has nothing left to do -- spawnScan returns immediately on a
+			// cancelled context. Dropping the Stop would leak a goroutine and a
+			// ticker without changing any observable behaviour, and a test that
+			// counted goroutines would be flaky for a resource leak this small.
+		})
 	}
 }
 
@@ -1535,5 +1656,673 @@ func TestWriteStrmLeavesNoTemporaryBehind(t *testing.T) {
 	got := entriesOf(t, filepath.Join(cfg.localPath, "Movies"))
 	if len(got) != 1 || got[0] != "Film.strm" {
 		t.Fatalf("directory holds %v, want just Film.strm", got)
+	}
+}
+
+// --- the gaps the mutation audit found -------------------------------------
+
+// update mode exists to rewrite a strm whose URL has changed. Nothing asserted
+// that it ever does: degrading the content comparison to "the file exists" left
+// the whole suite green, which in production means a changed siteUrl or
+// pathPrefix never reaches the files already on disk.
+func TestWriteLocalUpdateModeRewritesAStaleStrm(t *testing.T) {
+	shared := t.TempDir()
+	mk := func(site string) (*StrmSync, *scanConfig) {
+		return syncDriver(t, func(a *Addition) {
+			a.LocalMode = LocalModeUpdate
+			a.LocalPath = shared
+			a.SiteUrl = site
+			a.PathPrefix = "/d"
+			a.EncodePath = true
+		})
+	}
+	objs := []model.Obj{strmObj("Film.strm", "/src/Movies/Film.mkv")}
+
+	d, cfg := mk("https://old.example.com")
+	if err := d.writeLocalAt(context.Background(), cfg, "/Movies", objs); err != nil {
+		t.Fatalf("first writeLocal() error = %v", err)
+	}
+
+	d2, cfg2 := mk("https://new.example.com")
+	if err := d2.writeLocalAt(context.Background(), cfg2, "/Movies", objs); err != nil {
+		t.Fatalf("second writeLocal() error = %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(shared, "Movies", "Film.strm"))
+	if err != nil {
+		t.Fatalf("read strm: %v", err)
+	}
+	if want := "https://new.example.com/d/src/Movies/Film.mkv"; string(body) != want {
+		t.Fatalf("strm body = %q, want %q: update mode did not rewrite a stale file", body, want)
+	}
+	if d2.strmWritten.Load() != 1 {
+		t.Errorf("strmWritten = %d on the rewriting pass, want 1", d2.strmWritten.Load())
+	}
+}
+
+// spawnScan arms a new pass. Neither Store was observed anywhere: without the
+// budget one, sync mode silently deletes nothing at all; without the latch one,
+// a single exhausted pass turns deletion off permanently.
+func TestSpawnScanArmsTheBudgetForANewPass(t *testing.T) {
+	d, cfg := syncDriver(t, func(a *Addition) {
+		a.MaxDeletePerDir = 7
+		a.LocalMode = LocalModeUpdate
+	})
+	d.deleteBudget.Store(0)
+	d.deletionsOff.Store(true)
+
+	d.spawnScan(context.Background(), cfg, nil, "test")
+	t.Cleanup(func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for d.scanning.Load() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+
+	if got, want := d.deleteBudget.Load(), passDeleteBudget(cfg); got != want {
+		t.Errorf("deleteBudget = %d, want %d", got, want)
+	}
+	if d.deletionsOff.Load() {
+		t.Error("the deletion latch from an earlier pass was never cleared")
+	}
+}
+
+// The size of a pass budget is a safety property in its own right: it can be
+// widened into uselessness without any test noticing, because every budget test
+// sets the value itself.
+func TestPassDeleteBudgetScalesWithTheConfiguredCap(t *testing.T) {
+	// Literals, not expressions built from the constants: widening
+	// deleteBudgetFactor to 1000 must fail here, and it cannot if the expected
+	// value is derived from it.
+	_, custom := syncDriver(t, func(a *Addition) { a.MaxDeletePerDir = 7 })
+	if got := passDeleteBudget(custom); got != 28 {
+		t.Errorf("passDeleteBudget() with a cap of 7 = %d, want 28", got)
+	}
+	_, def := syncDriver(t)
+	if got := passDeleteBudget(def); got != 200 {
+		t.Errorf("passDeleteBudget() with the default cap = %d, want 200", got)
+	}
+}
+
+// The wiring between walk and writeLocal decides whether a neighbouring library
+// under localPath survives. Every existing test called deleteExtra directly, so
+// the argument walk passes was unguarded -- and flipping it to "always prune"
+// is a data-loss bug.
+func TestWalkPrunesBelowTheRootButNotAtAMultiSourceRoot(t *testing.T) {
+	d, cfg := syncDriver(t, func(a *Addition) {
+		a.Paths = "one:/src/one\ntwo:/src/two" // two sources => synthetic root
+		a.LocalMode = LocalModeSync
+	})
+	root := cfg.localPath
+	seed := func(rel, body string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o777); err != nil {
+			t.Fatalf("seed dir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+	}
+	seed("OtherLibrary/Film.strm", "x") // a neighbour at the mount root
+	seed("one/Gone/Film.strm", "x")     // an orphan one level down
+
+	list := func(ctx context.Context, mountPath string) ([]model.Obj, error) {
+		switch mountPath {
+		case "/":
+			return remoteObjs(nil, []string{"one", "two"}), nil
+		case "/one":
+			return remoteObjs(nil, []string{"Kept"}), nil
+		}
+		return nil, nil
+	}
+
+	if err := d.walk(context.Background(), cfg, "/", 0, list, nil, &scanStats{}); err != nil {
+		t.Fatalf("walk() error = %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(root, "OtherLibrary", "Film.strm")); err != nil {
+		t.Errorf("a neighbouring library was pruned at the mount root: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "one", "Gone", "Film.strm")); !os.IsNotExist(err) {
+		t.Errorf("an orphan below the root was not pruned, stat error = %v", err)
+	}
+}
+
+// A single-source storage is flattened onto its root, so there the root is a
+// real listing and refusing to prune it would leave every dropped top-level
+// folder behind forever -- which for the usual one-source-per-storage layout is
+// the entire feature.
+func TestWalkPrunesAtTheRootOfASingleSourceStorage(t *testing.T) {
+	d, cfg := syncDriver(t)
+	root := cfg.localPath
+	for _, rel := range []string{"Gone", "Kept"} {
+		if err := os.MkdirAll(filepath.Join(root, rel), 0o777); err != nil {
+			t.Fatalf("seed dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel, "Film.strm"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+	}
+
+	list := func(ctx context.Context, mountPath string) ([]model.Obj, error) {
+		if mountPath == "/" {
+			return remoteObjs(nil, []string{"Kept"}), nil
+		}
+		return remoteObjs([]string{"Film.strm"}, nil), nil
+	}
+
+	if err := d.walk(context.Background(), cfg, "/", 0, list, nil, &scanStats{}); err != nil {
+		t.Fatalf("walk() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Gone")); !os.IsNotExist(err) {
+		t.Errorf("the dropped top-level folder survived, stat error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Kept", "Film.strm")); err != nil {
+		t.Errorf("a folder the source still lists was touched: %v", err)
+	}
+}
+
+// An orphan the process cannot clean must not cost the pass anything, or one
+// unwritable directory drains the allowance on every pass forever.
+func TestABlockedOrphanPruneDoesNotSpendTheBudget(t *testing.T) {
+	d, cfg := syncDriver(t)
+	root := seedLocal(t, []string{"Gone/Film.strm", "Gone/movie.nfo"}, []string{"Gone"})
+
+	before := d.deleteBudget.Load()
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+
+	// The strm goes; the directory cannot, because the scraper's nfo holds it.
+	if _, err := os.Lstat(filepath.Join(root, "Gone", "Film.strm")); !os.IsNotExist(err) {
+		t.Fatalf("the orphaned strm survived, stat error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Gone")); err != nil {
+		t.Fatalf("the directory holding scraper output was removed: %v", err)
+	}
+	if got, want := d.deleteBudget.Load(), before-1; got != want {
+		t.Errorf("budget = %d, want %d: exactly the one deletion that happened should have been charged", got, want)
+	}
+}
+
+// The other half of the refund: a removal that fails *inside* an orphan tree.
+// The directory-level case above is a different line of code, and covering only
+// that one left the file-level accounting unguarded.
+func TestABlockedRemovalInsideAnOrphanDoesNotSpendTheBudget(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so no removal would fail")
+	}
+	d, cfg := syncDriver(t)
+	root := seedLocal(t, []string{"Gone/Film.strm"}, []string{"Gone"})
+
+	gone := filepath.Join(root, "Gone")
+	if err := os.Chmod(gone, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gone, 0o755) })
+
+	before := d.deleteBudget.Load()
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(gone, "Film.strm")); err != nil {
+		t.Fatalf("the removal succeeded after all, so this test proves nothing: %v", err)
+	}
+	if got := d.deleteBudget.Load(); got != before {
+		t.Errorf("budget = %d, want %d: nothing was removed, so nothing should have been charged", got, before)
+	}
+}
+
+// Deepest-first is what lets a subtree of nothing but strm files disappear in
+// one pass. Shallowest-first leaves empty shells behind for the media server to
+// show.
+func TestOrphanPruneCollapsesAPureStrmSubtreeInOnePass(t *testing.T) {
+	d, cfg := syncDriver(t)
+	root := seedLocal(t, []string{"Gone/Extras/Bonus.strm"}, []string{"Gone/Extras"})
+
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Gone")); !os.IsNotExist(err) {
+		t.Errorf("the whole subtree should have collapsed, but Gone survives (stat error = %v)", err)
+	}
+	if got := d.dirsDeleted.Load(); got != 2 {
+		t.Errorf("dirsDeleted = %d, want 2 (Extras and Gone)", got)
+	}
+}
+
+// Once a pass has given up on deleting it must stay given up, even if refunds
+// push the budget back above zero.
+func TestDeletionsStayOffEvenAfterARefundRestoresTheBudget(t *testing.T) {
+	d, cfg := syncDriver(t)
+	d.deleteBudget.Store(1)
+
+	spent := seedLocal(t, []string{"a.strm", "b.strm", "c.strm"}, nil)
+	if err := d.deleteExtraAt(context.Background(), cfg, spent, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if !d.deletionsOff.Load() {
+		t.Fatal("deletions were not latched off")
+	}
+
+	d.deleteBudget.Store(100) // as a refund elsewhere in the pass could
+	other := seedLocal(t, []string{"stale.strm"}, nil)
+	if err := d.deleteExtraAt(context.Background(), cfg, other, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(other, "stale.strm")); err != nil {
+		t.Errorf("deleting resumed after the latch was set: %v", err)
+	}
+}
+
+// The operator asked for the safety net to be off. Leaving the pass budget in
+// place would stop them at 200 entries with no way to say otherwise.
+func TestDisableDeleteProtectAlsoBypassesThePassBudget(t *testing.T) {
+	d, cfg := syncDriver(t, func(a *Addition) { a.DisableDeleteProtect = true })
+	d.deleteBudget.Store(1)
+
+	root := seedLocal(t, names("movie-", 60, ".strm"), nil)
+	if err := d.deleteExtraAt(context.Background(), cfg, root, nil); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if got := len(entriesOf(t, root)); got != 0 {
+		t.Fatalf("files remaining = %d, want 0: the budget still applied with protection disabled", got)
+	}
+}
+
+// walk must not spend a listing call on every media file it passes.
+func TestWalkDoesNotDescendIntoFiles(t *testing.T) {
+	d, cfg := newWalkDriver(t)
+	st := &scanStats{}
+	list := func(ctx context.Context, mountPath string) ([]model.Obj, error) {
+		if mountPath == "/" {
+			return remoteObjs([]string{"a.strm", "b.strm"}, []string{"sub"}), nil
+		}
+		return nil, nil
+	}
+
+	if err := d.walk(context.Background(), cfg, "/", 0, list, nil, st); err != nil {
+		t.Fatalf("walk() error = %v", err)
+	}
+	if st.scannedDirs != 2 {
+		t.Errorf("scannedDirs = %d, want 2: walk listed something that is not a directory", st.scannedDirs)
+	}
+}
+
+// The mount root of a multi-source storage is a folder per configured source.
+func TestListPathsAtTheMountRootListsOneFolderPerSource(t *testing.T) {
+	_, cfg := syncDriver(t, func(a *Addition) { a.Paths = "aliyun:/a\nquark:/q" })
+
+	objs, failed, err := cfg.listPaths(context.Background(), "/", false)
+	if err != nil {
+		t.Fatalf("listPaths() error = %v", err)
+	}
+	if failed != 0 {
+		t.Errorf("failed = %d, want 0", failed)
+	}
+	got := objNames(objs)
+	if want := []string{"aliyun", "quark"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("names = %v, want %v", got, want)
+	}
+	for _, o := range objs {
+		if !o.IsDir() {
+			t.Errorf("%s is not a folder", o.GetName())
+		}
+	}
+}
+
+// The predicate that decides what gets deleted. A source that lacks the path is
+// ordinary when several sources are merged under one key; a source that could
+// not answer is not, and reading one as the other deletes files that still
+// exist upstream.
+func TestCountsAsSourceFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "no error", err: nil, want: false},
+		{name: "object not found", err: errs.ObjectNotFound, want: false},
+		{name: "object not found, wrapped", err: errors.Join(errs.ObjectNotFound, errors.New("context")), want: false},
+		{name: "storage not found", err: errs.StorageNotFound, want: true},
+		{name: "rate limited", err: errors.New("429 too many requests"), want: true},
+		{name: "not a folder", err: errs.NotFolder, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countsAsSourceFailure(tc.err); got != tc.want {
+				t.Errorf("countsAsSourceFailure(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// And end to end: a source whose storage does not exist at all is counted, so
+// walk skips the directory rather than letting it drive a deletion.
+func TestListPathsCountsAnUnreachableSourceAsFailed(t *testing.T) {
+	_, cfg := syncDriver(t, func(a *Addition) { a.Paths = "movies:/no-such-a\nmovies:/no-such-b" })
+
+	_, failed, err := cfg.listPaths(context.Background(), "/movies/Inception", false)
+	if err != nil {
+		t.Fatalf("listPaths() error = %v", err)
+	}
+	if failed != 2 {
+		t.Errorf("failed = %d, want 2: both sources were unreachable", failed)
+	}
+}
+
+// A sibling mount that shares a prefix is not inside us.
+func TestBuildConfigAcceptsASiblingMountWithASharedPrefix(t *testing.T) {
+	a := &Addition{Paths: "/mnt2/movies", SiteUrl: "https://pan.example.com", LocalPath: "/tmp/strm"}
+	if _, err := buildConfig(a, "/mnt"); err != nil {
+		t.Fatalf("buildConfig() rejected a sibling mount: %v", err)
+	}
+}
+
+// A source that contains our own mount recurses just as surely as one inside it.
+func TestBuildConfigRejectsASourceThatContainsOurMount(t *testing.T) {
+	a := &Addition{Paths: "everything:/", SiteUrl: "https://pan.example.com", LocalPath: "/tmp/strm"}
+	if _, err := buildConfig(a, "/strm"); err == nil {
+		t.Fatal("buildConfig() accepted a source path that contains the storage's own mount")
+	}
+}
+
+// --- boundaries ------------------------------------------------------------
+
+func TestBoundaries(t *testing.T) {
+	t.Run("a file exactly at the size floor is kept", func(t *testing.T) {
+		_, cfg := syncDriver(t, func(a *Addition) { a.MinFileSize = 1 })
+		got := objNames(cfg.convert2strmObjs(context.Background(), "/src", sourceObjs(t, "Exact.mkv|1048576")))
+		if len(got) != 1 {
+			t.Fatalf("names = %v, want the file at exactly 1 MB to be kept", got)
+		}
+	})
+
+	t.Run("a batch that exactly exhausts the budget still runs", func(t *testing.T) {
+		d, cfg := syncDriver(t)
+		d.deleteBudget.Store(3)
+		root := seedLocal(t, []string{"a.strm", "b.strm", "c.strm"}, nil)
+
+		if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+			t.Fatalf("deleteExtra() error = %v", err)
+		}
+		if got := len(entriesOf(t, root)); got != 0 {
+			t.Errorf("files remaining = %d, want 0: a batch equal to the remaining budget must be allowed", got)
+		}
+		if d.deletionsOff.Load() {
+			t.Error("spending the budget exactly should not latch deletions off")
+		}
+	})
+
+	t.Run("a strm exactly at the depth limit is pruned", func(t *testing.T) {
+		d, cfg := syncDriver(t)
+		deep := "Gone"
+		for i := 0; i < maxScanDepth; i++ {
+			deep = filepath.Join(deep, "d")
+		}
+		root := seedLocal(t, []string{filepath.Join(deep, "Edge.strm")}, []string{deep})
+
+		if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+			t.Fatalf("deleteExtra() error = %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, deep, "Edge.strm")); !os.IsNotExist(err) {
+			t.Errorf("the strm at exactly the depth limit survived, stat error = %v", err)
+		}
+	})
+
+	t.Run("a source path without a leading slash still yields one", func(t *testing.T) {
+		_, cfg := syncDriver(t, func(a *Addition) { a.PathPrefix = ""; a.EncodePath = false })
+		got := cfg.getLink(context.Background(), "src/Movies/Film.mkv")
+		if want := "https://pan.example.com/src/Movies/Film.mkv"; got != want {
+			t.Errorf("getLink() = %s, want %s", got, want)
+		}
+	})
+}
+
+// --- attachments -----------------------------------------------------------
+
+// downloadAttachment had no coverage at all: the entire function could be
+// emptied out with the suite still green. It is also the only path that spends
+// real API quota -- on Aliyun every call shares a 0.9/s limiter with playback --
+// so "how often does it refetch" is a property worth pinning.
+func TestDownloadAttachment(t *testing.T) {
+	const body = "1\n00:00:01,000 --> 00:00:02,000\nhello\n"
+
+	newDriver := func(t *testing.T, mode string) (*StrmSync, *scanConfig, *int) {
+		t.Helper()
+		d, cfg := syncDriver(t, func(a *Addition) {
+			a.LocalMode = mode
+			a.DownloadSubtitle = true
+		})
+		calls := 0
+		d.linkFn = func(ctx context.Context, path string) (*model.Link, error) {
+			calls++
+			return &model.Link{
+				ContentLength: int64(len(body)),
+				RangeReader:   stream.GetRangeReaderFromMFile(int64(len(body)), strings.NewReader(body)),
+			}, nil
+		}
+		return d, cfg, &calls
+	}
+	attachment := func() model.Obj {
+		return &model.Object{Name: "Film.srt", Path: "/src/Movies/Film.srt", Size: int64(len(body))}
+	}
+
+	t.Run("downloads a missing attachment", func(t *testing.T) {
+		d, cfg, calls := newDriver(t, LocalModeUpdate)
+		if err := d.writeLocalAt(context.Background(), cfg, "/Movies", []model.Obj{attachment()}); err != nil {
+			t.Fatalf("writeLocal() error = %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(cfg.localPath, "Movies", "Film.srt"))
+		if err != nil {
+			t.Fatalf("read attachment: %v", err)
+		}
+		if string(got) != body {
+			t.Errorf("attachment = %q, want %q", got, body)
+		}
+		if *calls != 1 {
+			t.Errorf("link calls = %d, want 1", *calls)
+		}
+	})
+
+	t.Run("does not refetch when the size already matches", func(t *testing.T) {
+		d, cfg, calls := newDriver(t, LocalModeUpdate)
+		objs := []model.Obj{attachment()}
+		for i := 0; i < 3; i++ {
+			if err := d.writeLocalAt(context.Background(), cfg, "/Movies", objs); err != nil {
+				t.Fatalf("writeLocal() error = %v", err)
+			}
+		}
+		if *calls != 1 {
+			t.Errorf("link calls = %d after three passes, want 1: every extra call is real API quota", *calls)
+		}
+	})
+
+	t.Run("refetches a truncated attachment", func(t *testing.T) {
+		d, cfg, calls := newDriver(t, LocalModeUpdate)
+		dir := filepath.Join(cfg.localPath, "Movies")
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			t.Fatalf("seed dir: %v", err)
+		}
+		target := filepath.Join(dir, "Film.srt")
+		if err := os.WriteFile(target, []byte("half"), 0o644); err != nil {
+			t.Fatalf("seed truncated file: %v", err)
+		}
+
+		if err := d.writeLocalAt(context.Background(), cfg, "/Movies", []model.Obj{attachment()}); err != nil {
+			t.Fatalf("writeLocal() error = %v", err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read attachment: %v", err)
+		}
+		if string(got) != body {
+			t.Errorf("attachment = %q, want the refetched body", got)
+		}
+		if *calls != 1 {
+			t.Errorf("link calls = %d, want 1", *calls)
+		}
+	})
+
+	t.Run("insert mode never touches an existing attachment", func(t *testing.T) {
+		d, cfg, calls := newDriver(t, LocalModeInsert)
+		dir := filepath.Join(cfg.localPath, "Movies")
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			t.Fatalf("seed dir: %v", err)
+		}
+		target := filepath.Join(dir, "Film.srt")
+		if err := os.WriteFile(target, []byte("hand written"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+
+		if err := d.writeLocalAt(context.Background(), cfg, "/Movies", []model.Obj{attachment()}); err != nil {
+			t.Fatalf("writeLocal() error = %v", err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read attachment: %v", err)
+		}
+		if string(got) != "hand written" {
+			t.Errorf("insert mode overwrote an existing attachment: %q", got)
+		}
+		if *calls != 0 {
+			t.Errorf("link calls = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("a failed link leaves nothing behind", func(t *testing.T) {
+		d, cfg := syncDriver(t, func(a *Addition) {
+			a.LocalMode = LocalModeUpdate
+			a.DownloadSubtitle = true
+		})
+		d.linkFn = func(ctx context.Context, path string) (*model.Link, error) {
+			return nil, errors.New("429 too many requests")
+		}
+		if err := d.writeLocalAt(context.Background(), cfg, "/Movies", []model.Obj{attachment()}); err != nil {
+			t.Fatalf("writeLocal() error = %v", err)
+		}
+		if got := entriesOf(t, filepath.Join(cfg.localPath, "Movies")); len(got) != 0 {
+			t.Errorf("directory holds %v, want nothing after a failed link", got)
+		}
+	})
+}
+
+// --- leftover temporaries --------------------------------------------------
+
+// The temporary has to be hidden, and it must not look like something this
+// storage manages: if the suffix landed in the managed set a later pass would
+// count it against the cap and delete it as its own output.
+func TestWriteFileAtomicTemporaryIsHiddenAndUnmanaged(t *testing.T) {
+	_, cfg := syncDriver(t)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Film.strm")
+
+	var seen []string
+	err := writeFileAtomic(target, func(w io.Writer) error {
+		seen = entriesOf(t, dir)
+		_, err := w.Write([]byte("x"))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("writeFileAtomic() error = %v", err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("directory held %v mid-write, want exactly the temporary", seen)
+	}
+	tmp := seen[0]
+	if !strings.HasPrefix(tmp, ".") {
+		t.Errorf("temporary %q is not hidden; a media server would index it", tmp)
+	}
+	if cfg.isManaged(tmp) {
+		t.Errorf("temporary %q is in the managed set; a later pass would treat it as its own output", tmp)
+	}
+	if !isOurTemp(tmp) {
+		t.Errorf("temporary %q is not recognisable as ours, so it could never be cleaned up", tmp)
+	}
+}
+
+// A process killed between create and rename leaves a temporary behind. Nothing
+// else in this package would ever remove it, and while it sits there the
+// directory can never be seen as empty -- so it would pin an orphan forever.
+func TestSyncClearsAStaleTemporary(t *testing.T) {
+	d, cfg := syncDriver(t)
+	root := seedLocal(t, nil, nil)
+
+	stale := filepath.Join(root, tempNameFor("Film.strm"))
+	if err := os.WriteFile(stale, []byte("half"), 0o644); err != nil {
+		t.Fatalf("seed stale temporary: %v", err)
+	}
+	old := time.Now().Add(-2 * staleTempAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatalf("age the temporary: %v", err)
+	}
+
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Errorf("the stale temporary survived, stat error = %v", err)
+	}
+}
+
+// A temporary another instance is writing right now must survive.
+func TestSyncLeavesAFreshTemporaryAlone(t *testing.T) {
+	d, cfg := syncDriver(t)
+	root := seedLocal(t, nil, nil)
+
+	fresh := filepath.Join(root, tempNameFor("Film.strm"))
+	if err := os.WriteFile(fresh, []byte("in flight"), 0o644); err != nil {
+		t.Fatalf("seed temporary: %v", err)
+	}
+
+	if err := d.deleteExtraAt(context.Background(), cfg, root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Errorf("a temporary that could still be in flight was deleted: %v", err)
+	}
+}
+
+// Two writers aiming at the same target must not share a temporary path.
+func TestWriteFileAtomicTemporariesAreUnique(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		name := tempNameFor("Film.strm")
+		if seen[name] {
+			t.Fatalf("temporary name %q was handed out twice; two instances writing the same localPath would corrupt each other", name)
+		}
+		seen[name] = true
+	}
+}
+
+// An existing file's permissions must survive an update: rename would otherwise
+// quietly reset whatever an administrator had set.
+func TestWriteFileAtomicKeepsTheTargetMode(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root makes the mode assertions meaningless")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Film.strm")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(target, 0o640); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if err := writeFileAtomic(target, func(w io.Writer) error {
+		_, err := w.Write([]byte("new"))
+		return err
+	}); err != nil {
+		t.Fatalf("writeFileAtomic() error = %v", err)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Errorf("mode = %v, want 0640: the rename reset permissions", got)
 	}
 }

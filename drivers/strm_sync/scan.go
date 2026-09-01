@@ -268,7 +268,14 @@ func (d *StrmSync) walk(ctx context.Context, cfg *scanConfig, mountPath string, 
 	st.scannedDirs++
 	st.listedObjs += len(objs)
 
-	if err := d.writeLocal(ctx, cfg, mountPath, objs, depth > 0); err != nil {
+	// Orphan pruning needs objs to be a real directory listing. It is, at every
+	// depth -- except at the mount root of a multi-source storage, where objs is
+	// the synthetic list of configured source names. A single-source storage is
+	// flattened onto its root, so there the root is a real listing too, and
+	// refusing to prune it would leave every dropped top-level folder behind
+	// forever: for the common one-source-per-storage layout that is the whole
+	// feature.
+	if err := d.writeLocal(ctx, cfg, mountPath, objs, depth > 0 || cfg.autoFlatten); err != nil {
 		return err
 	}
 

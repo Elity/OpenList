@@ -2,9 +2,13 @@ package strm_sync
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -13,16 +17,48 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	// tempMarker and tempSuffix bracket the unique part of a temporary name.
+	// Together with the leading dot they make a file recognisably ours without
+	// putting it in the managed set, which is reserved for .strm.
+	tempMarker = ".strm-sync-"
+	tempSuffix = ".tmp"
+
+	// staleTempAge is how long a leftover temporary has to survive before a
+	// sync pass will clear it away. A write takes milliseconds, so anything
+	// this old was orphaned by a process that died mid-write -- while the delay
+	// still keeps us from deleting one that another instance is writing right
+	// now.
+	staleTempAge = time.Hour
+)
+
+// tempSeq disambiguates two temporaries created for the same target in the same
+// process, which two driver instances writing the same localPath can do: op
+// replaces a storage with a fresh instance while the old one's pass may still
+// be unwinding.
+var tempSeq atomic.Uint64
+
+func tempNameFor(base string) string {
+	return fmt.Sprintf(".%s%s%d-%d%s", base, tempMarker, os.Getpid(), tempSeq.Add(1), tempSuffix)
+}
+
+// isOurTemp reports whether a local file is a leftover from writeFileAtomic.
+func isOurTemp(name string) bool {
+	return strings.HasPrefix(name, ".") &&
+		strings.HasSuffix(name, tempSuffix) &&
+		strings.Contains(name, tempMarker)
+}
+
 // writeLocal materialises one directory listing. The local directory is created
 // lazily so that source directories holding nothing we care about do not leave
 // empty shells behind.
 //
-// allowPrune is false at the mount root. There, objs is the set of configured
-// source roots rather than a real directory listing, so a sibling tree sitting
-// next to ours under localPath is simply not described by it -- and must not be
-// mistaken for something the source dropped. This matters most during a
-// migration, when localPath is pointed at an existing strm tree whose every
-// file looks managed.
+// allowPrune says whether a local directory the listing does not mention may be
+// cleaned out. It is false only when objs is not a real directory listing --
+// that is, at the mount root of a multi-source storage, where objs is the set
+// of configured source names. Treating a sibling tree there as something the
+// source dropped would eat an unrelated library, which is exactly what a
+// migration looks like when localPath is pointed at an existing strm tree.
 func (d *StrmSync) writeLocal(ctx context.Context, cfg *scanConfig, mountPath string, objs []model.Obj, allowPrune bool) error {
 	localDir := cfg.localDirFor(mountPath)
 	ensured := false
@@ -100,15 +136,16 @@ func (d *StrmSync) writeStrm(ctx context.Context, cfg *scanConfig, obj model.Obj
 // content intact instead of a truncated or zero-byte stub, which the
 // size-and-existence staleness checks would then happily accept forever.
 //
-// The temporary is created with 0666 and no explicit chmod so that the process
-// umask still applies, matching what os.WriteFile would have done.
+// The temporary is created with 0666 so that the process umask applies exactly
+// as it would to os.WriteFile on a new file; when the target already exists its
+// mode is carried over instead, because a rename would otherwise quietly reset
+// permissions an administrator had set. Hard links and xattrs on the target do
+// not survive a rename -- that is inherent to the technique, and worth it.
 func writeFileAtomic(target string, write func(io.Writer) error) error {
 	dir, base := filepath.Dir(target), filepath.Base(target)
-	// A dotfile: media servers ignore it if a pass dies between create and
-	// rename, and the suffix keeps it out of the managed set either way.
-	tmp := filepath.Join(dir, "."+base+".strm-sync.tmp")
+	tmp := filepath.Join(dir, tempNameFor(base))
 
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		return err
 	}
@@ -119,6 +156,11 @@ func writeFileAtomic(target string, write func(io.Writer) error) error {
 
 	if err := write(f); err != nil {
 		return err
+	}
+	if info, err := os.Stat(target); err == nil {
+		if err := f.Chmod(info.Mode().Perm()); err != nil {
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -140,7 +182,7 @@ func (d *StrmSync) downloadAttachment(ctx context.Context, cfg *scanConfig, obj 
 			return
 		}
 	}
-	link, err := d.Link(ctx, obj, model.LinkArgs{})
+	link, err := d.attachmentLink(ctx, obj.GetPath())
 	if err != nil {
 		log.Warnf("[strm-sync] failed to link %s: %v", target, err)
 		return
@@ -173,18 +215,31 @@ func (d *StrmSync) downloadAttachment(ctx context.Context, cfg *scanConfig, obj 
 	}
 }
 
+// attachmentLink resolves a source object to a link. It goes straight to the
+// op layer rather than through d.Link so that a pass never reads the driver's
+// current configuration pointer: a pass works against the snapshot it started
+// with, and Drop can swap that pointer while it is still unwinding.
+func (d *StrmSync) attachmentLink(ctx context.Context, path string) (*model.Link, error) {
+	if d.linkFn != nil {
+		return d.linkFn(ctx, path)
+	}
+	link, _, err := linkTo(ctx, path, model.LinkArgs{})
+	return link, err
+}
+
 // deleteExtra removes what this storage generated and the source no longer has.
 //
 // Two properties are structural rather than judgemental:
-//   - only .strm files are candidates, so scraper output is untouchable
-//     regardless of how the storage is configured;
+//   - only .strm files and our own leftover temporaries are candidates, so
+//     scraper output is untouchable regardless of how the storage is configured;
 //   - directories go through os.Remove, never os.RemoveAll, so a directory that
 //     still holds anything survives whatever the guards decide.
 //
 // A local directory the remote listing no longer contains is an "orphan". The
 // scan cannot reach it on its own -- walk only descends into what the source
 // still returns -- so it is planned here, in full, before anything is removed:
-// the batch has to be sized before it can be judged.
+// the batch has to be sized before it can be judged, and every unit charged
+// against the budget has to be either performed or refunded.
 func (d *StrmSync) deleteExtra(ctx context.Context, cfg *scanConfig, localDir string, objs []model.Obj, allowPrune bool) error {
 	if utils.IsCanceled(ctx) {
 		return ctx.Err()
@@ -224,6 +279,10 @@ func (d *StrmSync) deleteExtra(ctx context.Context, cfg *scanConfig, localDir st
 			}
 			continue
 		}
+		if isStaleTemp(entry) {
+			delFiles = append(delFiles, name)
+			continue
+		}
 		if !cfg.isManaged(name) {
 			continue
 		}
@@ -239,41 +298,66 @@ func (d *StrmSync) deleteExtra(ctx context.Context, cfg *scanConfig, localDir st
 		}
 	}
 
-	// The cap is measured in entries, orphan contents included. Counting a
-	// whole subtree as one would let the number the operator configured mean
-	// something entirely different on the one path with no remote listing to
-	// check against.
-	pending := len(delFiles) + len(delDirs) + len(orphanDirs) + batch.files
-	if pending == 0 {
+	// Two different quantities, because the two guards answer two different
+	// questions.
+	//
+	// The per-directory cap asks "did this listing lose an implausible number
+	// of entries?", so it counts what is missing from *this* directory: an
+	// orphaned subtree is one missing entry no matter how deep it goes.
+	// Charging its contents here would refuse a legitimately removed ten-season
+	// show while doing nothing extra about a bad listing.
+	//
+	// The budget asks "is this pass removing too much overall?", so it counts
+	// actual work. Every unit charged to it is either performed or refunded
+	// below, which is what keeps an orphan nobody can remove from burning the
+	// allowance on every pass forever.
+	capPending := len(delFiles) + len(delDirs) + len(orphanDirs)
+	budgetUnits := len(delFiles) + len(delDirs) + batch.files + len(batch.dirs)
+	if capPending == 0 && budgetUnits == 0 {
 		return nil
 	}
-	if skip, reason := checkDeletion(cfg, len(objs), len(entries), pending); skip {
-		d.deleteBlocked.Add(int64(pending))
+	if skip, reason := checkDeletion(cfg, len(objs), len(entries), capPending); skip {
+		d.deleteBlocked.Add(int64(budgetUnits))
 		log.Warnf("[strm-sync] refused to delete %d entries (%d files, %d directories, %d orphaned trees holding %d files) under %s: %s; for example %v",
-			pending, len(delFiles), len(delDirs), len(orphanDirs), batch.files, localDir, reason,
+			budgetUnits, len(delFiles), len(delDirs), len(orphanDirs), batch.files, localDir, reason,
 			deletionSample(delFiles, delDirs, orphanDirs))
 		return nil
 	}
-	if !d.reserveDeleteBudget(cfg, pending) {
-		d.deleteBlocked.Add(int64(pending))
+	if !d.reserveDeleteBudget(cfg, budgetUnits) {
+		d.deleteBlocked.Add(int64(budgetUnits))
 		d.deletionsOff.Store(true)
 		log.Errorf("[strm-sync] mount=%s spent its deletion budget at %s; deletions are off for the rest of this pass, writing continues",
 			cfg.mountPath, localDir)
 		return nil
 	}
 
-	failed := d.removeEntries(localDir, delFiles, delDirs)
-	failed += batch.execute(d)
-	// A removal that could not happen destroyed nothing, so it must not consume
-	// the allowance. Otherwise one unwritable directory burns the budget every
-	// pass and the library slowly stops being written at all.
-	d.refundDeleteBudget(cfg, failed)
+	undone := d.removeEntries(localDir, delFiles, delDirs)
+	undone += batch.execute(d)
+	// Anything charged but not actually removed destroyed nothing, so it must
+	// not consume the allowance. Otherwise a directory the process cannot write
+	// to -- or an orphan a scraper keeps alive -- burns budget on every pass and
+	// the library slowly stops being written at all.
+	d.refundDeleteBudget(cfg, undone)
 	return nil
+}
+
+// isStaleTemp reports whether an entry is one of our temporaries, left behind
+// by a process that died between creating it and renaming it into place, and
+// old enough that nobody can still be writing it.
+func isStaleTemp(entry os.DirEntry) bool {
+	if !isOurTemp(entry.Name()) {
+		return false
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) > staleTempAge
 }
 
 // orphanBatch is a planned prune: the managed files found under orphaned
 // directories, deepest directory first so that a subtree of nothing but strm
-// files collapses in one pass.
+// files collapses in one pass instead of one level per pass.
 type orphanBatch struct {
 	dirs  []string
 	names [][]string
@@ -286,19 +370,25 @@ func (b *orphanBatch) add(dir string, files []string) {
 	b.files += len(files)
 }
 
+// execute performs the planned removals and returns how many planned units did
+// not happen, so the caller can refund exactly what it over-charged.
 func (b *orphanBatch) execute(d *StrmSync) int {
-	failed := 0
+	undone := 0
 	for i, dir := range b.dirs {
-		failed += d.removeEntries(dir, b.names[i], nil)
+		undone += d.removeEntries(dir, b.names[i], nil)
 		if !isEmptyDir(dir) {
+			// Something unmanaged is still in there -- a scraper's nfo, or a
+			// subtree the depth limit stopped us reaching. The directory was
+			// charged for, so give it back.
+			undone++
 			continue
 		}
 		// Hand the directory to removeEntries rather than removing it here:
 		// that is the one place that knows a directory must go through
 		// os.Remove, so anything that appeared in the meantime survives.
-		d.removeEntries(filepath.Dir(dir), nil, []string{filepath.Base(dir)})
+		undone += d.removeEntries(filepath.Dir(dir), nil, []string{filepath.Base(dir)})
 	}
-	return failed
+	return undone
 }
 
 // planOrphan walks an orphaned directory and records what could be removed,
@@ -325,7 +415,7 @@ func (c *scanConfig) planOrphan(ctx context.Context, dir string, depth int, batc
 			}
 			continue
 		}
-		if c.isManaged(entry.Name()) {
+		if c.isManaged(entry.Name()) || isStaleTemp(entry) {
 			files = append(files, entry.Name())
 		}
 	}

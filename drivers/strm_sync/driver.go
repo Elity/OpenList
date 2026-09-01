@@ -48,6 +48,9 @@ type StrmSync struct {
 	// keeps walking and keeps writing; only deleting stops.
 	deletionsOff atomic.Bool
 
+	// linkFn is a seam for tests; nil means resolve through the op layer.
+	linkFn func(ctx context.Context, path string) (*model.Link, error)
+
 	strmWritten   atomic.Int64
 	filesDeleted  atomic.Int64
 	dirsDeleted   atomic.Int64

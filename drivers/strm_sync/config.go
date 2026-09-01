@@ -100,7 +100,7 @@ func buildConfig(a *Addition, mountPath string) (*scanConfig, error) {
 		// d.List recurse into itself. op.List keys singleflight by path, so the
 		// inner call waits on the outer one on the same goroutine and the scan
 		// deadlocks; maxScanDepth does not help, it bounds walk and not this.
-		if mountPath != "" && underMount(v, mountPath) {
+		if mountPath != "" && (underMount(v, mountPath) || underMount(mountPath, v)) {
 			return nil, fmt.Errorf("source path %q is inside this storage's own mount %q", v, mountPath)
 		}
 		cfg.pathMap[k] = append(cfg.pathMap[k], v)
@@ -124,15 +124,17 @@ func buildConfig(a *Addition, mountPath string) (*scanConfig, error) {
 	return cfg, nil
 }
 
-// underMount reports whether a source path is the storage's own mount point or
-// sits inside it. Both sides are POSIX mount paths.
+// underMount reports whether path is mount, or sits inside it. Both sides are
+// POSIX mount paths.
+//
+// The trailing separator matters: without it "/mnt2" would read as being inside
+// "/mnt". Trimming a trailing slash first means "/" becomes "", which is why the
+// prefix test uses mount+"/" -- for a root mount that is "/", and everything is
+// inside it, which is the right answer.
 func underMount(path, mount string) bool {
 	path = strings.TrimSuffix(path, "/")
 	mount = strings.TrimSuffix(mount, "/")
-	if mount == "" {
-		return false
-	}
-	return path == mount || strings.HasPrefix(path, mount+"/")
+	return path == mount || strings.HasPrefix(path+"/", mount+"/")
 }
 
 func parseSuffixes(list string) map[string]struct{} {

@@ -33,12 +33,17 @@ guards stand between a bad listing and a lost library:
 2. **An empty remote listing never deletes.** If a directory comes back with no
    entries while the local side has some, the batch is refused outright.
 3. **A per-directory cap** (`maxDeletePerDir`, default 50) refuses a batch
-   larger than itself. Orphaned directories are counted as their contents, not
-   as one entry.
+   larger than itself. It asks "did this listing lose an implausible number of
+   entries?", so an orphaned subtree counts as the one entry it is, however
+   deep it goes — charging its contents here would refuse a legitimately
+   removed ten-season show without saying anything more about a bad listing.
 4. **A per-pass budget** (cap × 4) bounds the whole sweep, because a listing
    failure spread thinly over a thousand directories produces a thousand
-   individually plausible deletions. Spending it latches deletions off for the
-   rest of the pass; writing continues.
+   individually plausible deletions. This one counts actual work — every file
+   and every directory — and every unit charged is either performed or
+   refunded, so an orphan nobody can remove does not drain the allowance on
+   each pass. Spending it latches deletions off for the rest of the pass;
+   writing continues.
 
 `os.RemoveAll` does not appear in this package. A directory is removed only
 once it is genuinely empty, and only through `os.Remove`, so losing the race
@@ -75,10 +80,19 @@ structural and cannot be turned off.
   the whole tree for its `cache_expiration`, and expect one real API call per
   directory per pass. `scanRateLimitPerSec` is the throttle; 0 means rely on the
   source driver's own limiter.
-- **`localPath` should belong to this storage alone.** It must be absolute and
-  not a filesystem root. Orphan pruning is skipped at the mount root precisely
-  so that a neighbouring tree survives, but sharing the directory is still a bad
-  idea.
+- **Orphan cleanup does not run at the mount root of a multi-source storage.**
+  There the listing is the set of configured source names rather than a
+  directory, so a neighbouring tree cannot be told apart from something the
+  source dropped. A single-source storage is flattened onto its root, so there
+  it does run.
+- **A partial listing can still slip through.** `internal/fs` swallows the
+  underlying error when the path has virtual sub-storages mounted under it, so
+  a truncated listing may arrive with no failure reported. The cap and the
+  budget are what stand behind that.
+- **`localPath` must belong to this storage alone.** It has to be absolute and
+  not a filesystem root, and it should not be shared with another tool: for a
+  single-source storage the mount root is pruned like any other directory, so a
+  neighbouring strm tree sitting there would be treated as ours.
 - **Case-insensitive filesystems.** If the source renames `movie.mkv` to
   `Movie.mkv`, the on-disk name will not change while the content comparison
   says the file is already correct, and the deletion pass may then remove it and
