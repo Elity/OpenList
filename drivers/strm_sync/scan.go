@@ -64,14 +64,18 @@ func checkDeletion(d *StrmSync, remoteCount, localCount, pending int) (skip bool
 	if remoteCount == 0 && localCount > 0 {
 		return true, fmt.Sprintf("remote listing is empty while %d local entries exist", localCount)
 	}
-	limit := d.MaxDeletePerDir
-	if limit <= 0 {
-		limit = defaultMaxDeletePerDir
-	}
-	if pending > limit {
+	if limit := d.maxDeletePerDir(); pending > limit {
 		return true, fmt.Sprintf("deletion batch of %d exceeds the per-directory cap of %d", pending, limit)
 	}
 	return false, ""
+}
+
+// maxDeletePerDir is the configured cap, or the default when it is unset.
+func (d *StrmSync) maxDeletePerDir() int {
+	if d.MaxDeletePerDir > 0 {
+		return d.MaxDeletePerDir
+	}
+	return defaultMaxDeletePerDir
 }
 
 // reserveDeleteBudget draws from what one pass is allowed to delete in total.
@@ -90,11 +94,7 @@ func (d *StrmSync) reserveDeleteBudget(n int) (ok bool, reason string) {
 }
 
 func (d *StrmSync) passDeleteBudget() int64 {
-	limit := d.MaxDeletePerDir
-	if limit <= 0 {
-		limit = defaultMaxDeletePerDir
-	}
-	return int64(limit) * deleteBudgetFactor
+	return int64(d.maxDeletePerDir()) * deleteBudgetFactor
 }
 
 // startScan wires up the periodic scan. Called at the end of Init.

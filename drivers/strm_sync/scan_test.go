@@ -198,7 +198,7 @@ func TestDeleteExtraLeavesScraperOutputAlone(t *testing.T) {
 	}, nil)
 
 	d := syncDriver() // no attachments enabled
-	if err := d.deleteExtra(root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestDeleteExtraRemovesAttachmentsOnceTheyAreManaged(t *testing.T) {
 	root := seedLocal(t, []string{"keep.strm", "stale.srt", "keep.nfo"}, nil)
 
 	d := syncDriver("srt")
-	if err := d.deleteExtra(root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestDeleteExtraNeverRemovesANonEmptyDirectory(t *testing.T) {
 	}
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, remoteObjs([]string{"other.strm"}, nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"other.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestDeleteExtraRemovesAnEmptyDirectory(t *testing.T) {
 	root := seedLocal(t, []string{"keep.strm"}, []string{"Gone"})
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -270,7 +270,7 @@ func TestDeleteExtraRefusesAnEmptyRemoteListing(t *testing.T) {
 	root := seedLocal(t, []string{"a.strm", "b.strm", "c.strm"}, nil)
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, nil); err != nil {
+	if err := d.deleteExtra(context.Background(), root, nil); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestDeleteExtraRefusesBatchesOverTheCap(t *testing.T) {
 	root := seedLocal(t, names("local-", 100, ".strm"), nil)
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, remoteObjs(names("remote-", 100, ".strm"), nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs(names("remote-", 100, ".strm"), nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -302,7 +302,7 @@ func TestDeleteExtraEmptiesSmallDisjointBatchesOutsideAPass(t *testing.T) {
 	root := seedLocal(t, names("local-", 3, ".strm"), nil)
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, remoteObjs(names("remote-", 3, ".strm"), nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs(names("remote-", 3, ".strm"), nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -316,7 +316,7 @@ func TestDeleteExtraHonoursDisableDeleteProtect(t *testing.T) {
 
 	d := syncDriver()
 	d.DisableDeleteProtect = true
-	if err := d.deleteExtra(root, nil); err != nil {
+	if err := d.deleteExtra(context.Background(), root, nil); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -337,7 +337,7 @@ func TestDeleteBudgetStopsAWipeSpreadAcrossDirectories(t *testing.T) {
 	emptied, aborted := 0, false
 	for i := 0; i < 20; i++ {
 		root := seedLocal(t, names("local-", 3, ".strm"), nil)
-		err := d.deleteExtra(root, remoteObjs(names("remote-", 3, ".strm"), nil))
+		err := d.deleteExtra(context.Background(), root, remoteObjs(names("remote-", 3, ".strm"), nil))
 		if errors.Is(err, errDeleteBudgetExhausted) {
 			aborted = true
 			break
@@ -362,7 +362,7 @@ func TestDeleteBudgetDoesNotApplyOutsideAPass(t *testing.T) {
 	d.deleteBudget.Store(0) // exhausted by an earlier pass
 
 	root := seedLocal(t, []string{"a.strm"}, nil)
-	if err := d.deleteExtra(root, remoteObjs([]string{"b.strm"}, nil)); err != nil {
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"b.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
@@ -630,7 +630,16 @@ func TestWalkStopsWhenTheContextIsCancelled(t *testing.T) {
 // against. Here a single genuinely stale strm sits among sixty directories that
 // still hold scraper output: counting those would push the batch over the cap
 // and block a deletion that should have gone through.
-func TestDeleteExtraDoesNotSpendTheCapOnUndeletableDirectories(t *testing.T) {
+// TestDeleteExtraCountsOrphanedDirectoriesTowardsTheCap pins a deliberate
+// trade-off. These directories cannot be removed -- a scraper's nfo keeps every
+// one of them alive -- so counting them costs a legitimate single-file deletion
+// that would otherwise have gone through.
+//
+// They are counted anyway: 60 directories disappearing from one listing is the
+// shape of a source returning a fraction of a directory, and that is exactly
+// what the cap exists to catch. Deciding an orphan is harmless would mean
+// walking it first, which is both expensive and racy.
+func TestDeleteExtraCountsOrphanedDirectoriesTowardsTheCap(t *testing.T) {
 	dirs := names("season-", 60, "")
 	root := seedLocal(t, []string{"stale.strm"}, dirs)
 	for _, dir := range dirs {
@@ -640,15 +649,50 @@ func TestDeleteExtraDoesNotSpendTheCapOnUndeletableDirectories(t *testing.T) {
 	}
 
 	d := syncDriver()
-	if err := d.deleteExtra(root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+	logs := captureLogs(t)
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
 		t.Fatalf("deleteExtra() error = %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(root, "stale.strm")); !os.IsNotExist(err) {
-		t.Fatalf("the stale strm survived: undeletable directories were counted against the cap (stat err = %v)", err)
+	if _, err := os.Stat(filepath.Join(root, "stale.strm")); err != nil {
+		t.Errorf("the whole batch should have been refused, so the stale strm stays: %v", err)
 	}
-	if d.deleteBlocked.Load() != 0 {
-		t.Errorf("deleteBlocked = %d, want 0", d.deleteBlocked.Load())
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(root, dir, "movie.nfo")); err != nil {
+			t.Fatalf("scraper output under %s was touched: %v", dir, err)
+		}
+	}
+	if got := d.deleteBlocked.Load(); got != 61 {
+		t.Errorf("deleteBlocked = %d, want 61", got)
+	}
+	if !strings.Contains(logs.String(), "orphaned trees") {
+		t.Errorf("the refusal did not mention orphans, got: %s", logs.String())
+	}
+}
+
+// A handful of orphans is business as usual: the stale file goes, the orphaned
+// strm goes with it, and the directory a scraper still owns survives.
+func TestDeleteExtraPrunesASmallNumberOfOrphans(t *testing.T) {
+	d := syncDriver()
+	root := seedLocal(t,
+		[]string{"stale.strm", "Gone/Movie.strm", "Gone/Movie.nfo"},
+		[]string{"Gone"})
+
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"keep.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	for _, rel := range []string{"stale.strm", "Gone/Movie.strm"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s should have been removed, stat error = %v", rel, err)
+		}
+	}
+	for _, rel := range []string{"Gone", "Gone/Movie.nfo"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("%s should have survived: %v", rel, err)
+		}
+	}
+	if got := d.deleteBlocked.Load(); got != 0 {
+		t.Errorf("deleteBlocked = %d, want 0", got)
 	}
 }
 
@@ -808,5 +852,157 @@ func TestAwaitScanExitGivesUpAfterTheTimeout(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "did not unwind") {
 		t.Fatalf("awaitScanExit() gave up silently; log = %q", buf.String())
+	}
+}
+
+// --- directories the source dropped ----------------------------------------
+
+// TestSyncPrunesManagedFilesUnderADirectoryTheSourceDropped covers the case the
+// scan cannot reach on its own: walk only descends into directories the remote
+// listing still contains, so once a whole source directory disappears nothing
+// ever visits its local counterpart again and the strm files under it go stale
+// forever. Emby shows those as entries that fail on play.
+func TestSyncPrunesManagedFilesUnderADirectoryTheSourceDropped(t *testing.T) {
+	d := syncDriver()
+	root := seedLocal(t,
+		[]string{
+			"Gone/Movie.strm",
+			"Gone/Movie.nfo",
+			"Gone/Extras/Bonus.strm",
+			"Kept/Movie.strm",
+		},
+		[]string{"Gone/Extras", "Kept"})
+
+	if err := d.deleteExtra(context.Background(), root, remoteObjs(nil, []string{"Kept"})); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+
+	for _, rel := range []string{"Gone/Movie.strm", "Gone/Extras/Bonus.strm", "Gone/Extras"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s should have been pruned, stat error = %v", rel, err)
+		}
+	}
+	// Gone itself survives because a scraper's nfo is still in it, and Kept is
+	// still listed remotely so this call must not reach inside it at all.
+	for _, rel := range []string{"Gone", "Gone/Movie.nfo", "Kept", "Kept/Movie.strm"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("%s should have survived: %v", rel, err)
+		}
+	}
+	if got := d.filesDeleted.Load(); got != 2 {
+		t.Errorf("filesDeleted = %d, want 2", got)
+	}
+	if got := d.dirsDeleted.Load(); got != 1 {
+		t.Errorf("dirsDeleted = %d, want 1", got)
+	}
+}
+
+// TestOrphanPruneRefusesWhenTooManyDirectoriesLookOrphaned is the guard that
+// makes the prune safe to add at all. Pruning is the one deletion path with no
+// remote listing to check against, so a source that hiccups and returns a
+// fraction of a directory makes every omitted child look dropped. Counting the
+// orphans towards the per-directory cap is what stops that from cascading.
+func TestOrphanPruneRefusesWhenTooManyDirectoriesLookOrphaned(t *testing.T) {
+	d := syncDriver()
+	d.MaxDeletePerDir = 3
+
+	var files, dirs []string
+	for _, name := range names("dir", 4, "") {
+		dirs = append(dirs, name)
+		files = append(files, name+"/Movie.strm")
+	}
+	root := seedLocal(t, files, dirs)
+	logs := captureLogs(t)
+
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	for _, rel := range files {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("%s should have survived a refused batch: %v", rel, err)
+		}
+	}
+	if got := d.deleteBlocked.Load(); got != 4 {
+		t.Errorf("deleteBlocked = %d, want 4", got)
+	}
+	if !strings.Contains(logs.String(), "exceeds the per-directory cap") {
+		t.Errorf("refusal was not logged, got: %s", logs.String())
+	}
+}
+
+// TestOrphanPruneRespectsThePassBudget keeps the prune under the same whole-pass
+// ceiling as every other deletion, so a wide orphan tree cannot spend an
+// unbounded number of deletions just because each directory looks small.
+func TestOrphanPruneRespectsThePassBudget(t *testing.T) {
+	d := syncDriver()
+	d.MaxDeletePerDir = 4
+	d.scanning.Store(true)
+	d.deleteBudget.Store(3)
+
+	root := seedLocal(t,
+		[]string{"aa/1.strm", "aa/2.strm", "bb/1.strm", "bb/2.strm"},
+		[]string{"aa", "bb"})
+
+	err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"anchor.strm"}, nil))
+	if !errors.Is(err, errDeleteBudgetExhausted) {
+		t.Fatalf("deleteExtra() error = %v, want errDeleteBudgetExhausted", err)
+	}
+	// The first directory fits (2 files + the now-empty directory = 3); the
+	// second must be untouched rather than half-deleted.
+	if _, err := os.Lstat(filepath.Join(root, "aa")); !os.IsNotExist(err) {
+		t.Errorf("aa should have been pruned away, stat error = %v", err)
+	}
+	for _, rel := range []string{"bb/1.strm", "bb/2.strm"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("%s should have survived the exhausted budget: %v", rel, err)
+		}
+	}
+}
+
+// TestOrphanPruneStopsAtTheDepthLimit mirrors the bound walk already has. A
+// local tree deep enough to blow the stack is not reachable from a sane source,
+// but the prune recurses over whatever is on disk, which is not the same thing.
+func TestOrphanPruneStopsAtTheDepthLimit(t *testing.T) {
+	d := syncDriver()
+	deep := "Gone"
+	for i := 0; i <= maxScanDepth; i++ {
+		deep = filepath.Join(deep, "d")
+	}
+	root := seedLocal(t, []string{filepath.Join(deep, "Deep.strm"), "Gone/Shallow.strm"}, []string{deep})
+	logs := captureLogs(t)
+
+	if err := d.deleteExtra(context.Background(), root, remoteObjs([]string{"anchor.strm"}, nil)); err != nil {
+		t.Fatalf("deleteExtra() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Gone/Shallow.strm")); !os.IsNotExist(err) {
+		t.Errorf("the shallow strm should have been pruned, stat error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, deep, "Deep.strm")); err != nil {
+		t.Errorf("the strm past the depth limit should have been left alone: %v", err)
+	}
+	if !strings.Contains(logs.String(), "depth limit") {
+		t.Errorf("the depth cut-off was not logged, got: %s", logs.String())
+	}
+}
+
+// The flat part of a deletion is one ReadDir and a capped batch, but the prune
+// recurses over whatever is on disk, so it is the part that has to notice a
+// cancelled pass rather than run to completion after Drop.
+func TestOrphanPruneStopsWhenTheContextIsCancelled(t *testing.T) {
+	d := syncDriver()
+	root := seedLocal(t, []string{"Gone/Movie.strm"}, []string{"Gone"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := d.deleteExtra(ctx, root, remoteObjs([]string{"anchor.strm"}, nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("deleteExtra() error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "Gone/Movie.strm")); err != nil {
+		t.Errorf("a cancelled prune should not have deleted anything: %v", err)
+	}
+	if got := d.filesDeleted.Load(); got != 0 {
+		t.Errorf("filesDeleted = %d, want 0", got)
 	}
 }
