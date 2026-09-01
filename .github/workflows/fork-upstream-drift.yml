@@ -1,0 +1,56 @@
+name: Fork Upstream Drift
+
+# Fork-only workflow. drivers/strm_sync carries ~200 lines adapted from
+# drivers/strm; nothing keeps the two in sync, so a fix upstream is invisible
+# here until somebody thinks to look. This turns that silent drift into a
+# failing check.
+#
+# Deliberately a new file rather than an edit to an upstream workflow: a path
+# upstream does not have can never produce a rebase conflict.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Monday morning, off the hour so it does not pile onto everyone else's cron.
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Check drivers/strm for upstream changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/OpenListTeam/OpenList.git
+          git fetch --quiet upstream main
+
+      - name: Compare against the recorded baseline
+        run: |
+          baseline="$(grep -v '^#' drivers/strm_sync/UPSTREAM_BASELINE | tr -d '[:space:]')"
+          if [ -z "$baseline" ]; then
+            echo "::error::drivers/strm_sync/UPSTREAM_BASELINE holds no revision"
+            exit 1
+          fi
+          echo "baseline: $baseline"
+
+          watched="drivers/strm/util.go drivers/strm/driver.go drivers/strm/meta.go"
+          new="$(git log --oneline "$baseline..upstream/main" -- $watched)"
+          if [ -z "$new" ]; then
+            echo "no upstream changes to the files strm_sync was adapted from"
+            exit 0
+          fi
+
+          echo "::warning::upstream has moved the files strm_sync was adapted from"
+          echo "$new"
+          echo
+          echo "Review each commit, port what applies to drivers/strm_sync, then"
+          echo "move the SHA in drivers/strm_sync/UPSTREAM_BASELINE forward."
+          exit 1

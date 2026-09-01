@@ -21,7 +21,7 @@ const (
 
 type Addition struct {
 	Paths   string `json:"paths" required:"true" type:"text" help:"One source path per line"`
-	SiteUrl string `json:"siteUrl" required:"true" type:"text" help:"URL prefix written into the strm files, e.g. https://pan.example.com"`
+	SiteUrl string `json:"siteUrl" required:"false" type:"text" help:"URL prefix written into the strm files, e.g. https://pan.example.com. Required unless withoutUrl is set: a scheduled scan has no request to derive it from"`
 
 	PathPrefix      string `json:"pathPrefix" type:"text" required:"false" default:"/d"`
 	FilterFileTypes string `json:"filterFileTypes" type:"text" required:"false" default:"mp4,mkv,flv,avi,wmv,ts,rmvb,webm,mp3,flac,aac,wav,ogg,m4a,wma,alac" help:"Media suffixes that become strm files"`

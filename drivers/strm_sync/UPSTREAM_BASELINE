@@ -1,0 +1,8 @@
+# Upstream revision drivers/strm_sync was branched from.
+#
+# util.go and the Get/List/Link bodies in driver.go are adapted from
+# drivers/strm at this commit. Nothing keeps them in sync automatically, so
+# .github/workflows/fork-upstream-drift.yml fails when upstream touches those
+# files past this point. When you have reviewed the new upstream commits and
+# either ported or consciously skipped them, move this SHA forward.
+394bb8f8

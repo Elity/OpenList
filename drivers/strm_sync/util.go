@@ -21,9 +21,9 @@ import (
 // immutable snapshot rather than the live driver, and that listPaths reports
 // how many sources failed instead of swallowing it.
 //
-// Re-check upstream with:
-//
-//	git log 394bb8f8..upstream/main -- drivers/strm/util.go drivers/strm/driver.go
+// The revision they were taken from is recorded in UPSTREAM_BASELINE, and
+// .github/workflows/fork-upstream-drift.yml fails when upstream moves them past
+// it. See README.md.
 
 func (c *scanConfig) listRoot() []model.Obj {
 	var objs []model.Obj

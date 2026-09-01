@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -612,7 +613,15 @@ func newWalkDriver(t *testing.T) (*StrmSync, *scanConfig) {
 // the stack blows, which is a fatal error Go cannot recover from.
 func TestWalkStopsAtTheDepthLimit(t *testing.T) {
 	d, cfg := newWalkDriver(t)
+	// The source keeps handing back one more sub-directory, but only up to a
+	// bound well past the limit. An unbounded fake would make a walk with the
+	// limit removed recurse until the test binary is killed, which reads as a
+	// timeout rather than as a failed assertion.
+	const runway = maxScanDepth * 4
 	list := func(ctx context.Context, mountPath string) ([]model.Obj, error) {
+		if strings.Count(mountPath, "/") > runway {
+			return nil, nil
+		}
 		return remoteObjs(nil, []string{"deeper"}), nil
 	}
 
@@ -1450,5 +1459,81 @@ func TestWriteLocalRefusesNamesThatEscapeTheDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfg.localPath, "Movies", "Fine.strm")); err != nil {
 		t.Errorf("the well-formed sibling was not written: %v", err)
+	}
+}
+
+// --- atomic writes ---------------------------------------------------------
+
+// A write that dies half way must leave the previous file alone. Both staleness
+// checks in this package are "does it exist" and "is the size right", so a
+// truncated file written in place would be accepted as correct on every
+// subsequent pass -- permanently, in insert mode.
+func TestWriteFileAtomicLeavesTheTargetIntactWhenTheWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Film.strm")
+	if err := os.WriteFile(target, []byte("the old body"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	boom := errors.New("connection reset")
+	err := writeFileAtomic(target, func(w io.Writer) error {
+		_, _ = w.Write([]byte("half a "))
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("writeFileAtomic() error = %v, want %v", err, boom)
+	}
+
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(body) != "the old body" {
+		t.Errorf("target = %q, want the untouched old body", body)
+	}
+	if got := entriesOf(t, dir); len(got) != 1 || got[0] != "Film.strm" {
+		t.Errorf("directory holds %v, want just the target: the temporary was not cleaned up", got)
+	}
+}
+
+func TestWriteFileAtomicReplacesTheBody(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Film.strm")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := writeFileAtomic(target, func(w io.Writer) error {
+		_, err := w.Write([]byte("https://pan.example.com/d/x.mkv"))
+		return err
+	}); err != nil {
+		t.Fatalf("writeFileAtomic() error = %v", err)
+	}
+
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if want := "https://pan.example.com/d/x.mkv"; string(body) != want {
+		t.Errorf("target = %q, want %q", body, want)
+	}
+	if got := entriesOf(t, dir); len(got) != 1 {
+		t.Errorf("directory holds %v, want just the target", got)
+	}
+}
+
+// The end-to-end shape: a pass leaves exactly the strm file behind, with no
+// temporary next to it for a media server to trip over.
+func TestWriteStrmLeavesNoTemporaryBehind(t *testing.T) {
+	d, cfg := syncDriver(t, func(a *Addition) { a.LocalMode = LocalModeUpdate })
+
+	objs := []model.Obj{strmObj("Film.strm", "/src/Movies/Film.mkv")}
+	if err := d.writeLocalAt(context.Background(), cfg, "/Movies", objs); err != nil {
+		t.Fatalf("writeLocal() error = %v", err)
+	}
+
+	got := entriesOf(t, filepath.Join(cfg.localPath, "Movies"))
+	if len(got) != 1 || got[0] != "Film.strm" {
+		t.Fatalf("directory holds %v, want just Film.strm", got)
 	}
 }

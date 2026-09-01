@@ -2,6 +2,7 @@ package strm_sync
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -80,11 +81,49 @@ func (d *StrmSync) writeStrm(ctx context.Context, cfg *scanConfig, obj model.Obj
 	if existing, err := os.ReadFile(target); err == nil && string(existing) == content {
 		return
 	}
-	if err := os.WriteFile(target, []byte(content), 0o666); err != nil {
+	err := writeFileAtomic(target, func(w io.Writer) error {
+		_, err := w.Write([]byte(content))
+		return err
+	})
+	if err != nil {
 		log.Warnf("[strm-sync] failed to write %s: %v", target, err)
 		return
 	}
 	d.strmWritten.Add(1)
+}
+
+// writeFileAtomic writes through a hidden sibling and renames it into place.
+//
+// os.Rename within a directory is atomic, so a media server that opens the file
+// while a pass is running sees either the whole old body or the whole new one,
+// never a half-written line -- and an interrupted write leaves the previous
+// content intact instead of a truncated or zero-byte stub, which the
+// size-and-existence staleness checks would then happily accept forever.
+//
+// The temporary is created with 0666 and no explicit chmod so that the process
+// umask still applies, matching what os.WriteFile would have done.
+func writeFileAtomic(target string, write func(io.Writer) error) error {
+	dir, base := filepath.Dir(target), filepath.Base(target)
+	// A dotfile: media servers ignore it if a pass dies between create and
+	// rename, and the suffix keeps it out of the managed set either way.
+	tmp := filepath.Join(dir, "."+base+".strm-sync.tmp")
+
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		f.Close()
+		os.Remove(tmp) // a no-op once the rename below has succeeded
+	}()
+
+	if err := write(f); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, target)
 }
 
 // downloadAttachment fetches a subtitle/image/nfo alongside the strm files.
@@ -122,14 +161,15 @@ func (d *StrmSync) downloadAttachment(ctx context.Context, cfg *scanConfig, obj 
 		return
 	}
 	defer rc.Close()
-	f, err := os.Create(target)
-	if err != nil {
-		log.Warnf("[strm-sync] failed to create %s: %v", target, err)
-		return
-	}
-	defer f.Close()
-	if _, err := utils.CopyWithBuffer(f, rc); err != nil {
-		log.Warnf("[strm-sync] failed to copy %s: %v", target, err)
+	// Through the atomic writer: staleness here is judged by size and existence
+	// alone, so a download cut off half way would otherwise leave a short file
+	// that insert mode never revisits and update mode only fixes if the length
+	// happens to differ.
+	if err := writeFileAtomic(target, func(w io.Writer) error {
+		_, err := utils.CopyWithBuffer(w, rc)
+		return err
+	}); err != nil {
+		log.Warnf("[strm-sync] failed to write %s: %v", target, err)
 	}
 }
 
