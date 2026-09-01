@@ -6,6 +6,7 @@ import (
 	stdpath "path"
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -14,18 +15,23 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 )
 
-// This file is a copy of drivers/strm/util.go with the receiver renamed. The
-// path resolution here is the fiddly part of the upstream driver and is worth
-// keeping identical; see the fork notes in scan.go for what we did change.
+// The path resolution here is adapted from drivers/strm/util.go (upstream
+// revision 394bb8f8). The bodies are kept line-comparable with upstream so a
+// later fix there can be read across; what changed is that the receiver is the
+// immutable snapshot rather than the live driver, and that listPaths reports
+// how many sources failed instead of swallowing it.
+//
+// Re-check upstream with:
+//
+//	git log 394bb8f8..upstream/main -- drivers/strm/util.go drivers/strm/driver.go
 
-func (d *StrmSync) listRoot() []model.Obj {
+func (c *scanConfig) listRoot() []model.Obj {
 	var objs []model.Obj
-	for k := range d.pathMap {
+	for k := range c.pathMap {
 		obj := model.Object{
 			Path:     "/" + k,
 			Name:     k,
 			IsFolder: true,
-			Modified: d.Modified,
 		}
 		objs = append(objs, &obj)
 	}
@@ -42,9 +48,9 @@ func getPair(path string) (string, string) {
 	return stdpath.Base(path), path
 }
 
-func (d *StrmSync) getRootAndPath(path string) (string, string) {
-	if d.autoFlatten {
-		return d.oneKey, path
+func (c *scanConfig) getRootAndPath(path string) (string, string) {
+	if c.autoFlatten {
+		return c.oneKey, path
 	}
 	path = strings.TrimPrefix(path, "/")
 	parts := strings.SplitN(path, "/", 2)
@@ -54,13 +60,37 @@ func (d *StrmSync) getRootAndPath(path string) (string, string) {
 	return parts[0], parts[1]
 }
 
-func (d *StrmSync) list(ctx context.Context, dst, sub string, args *fs.ListArgs) ([]model.Obj, error) {
-	reqPath := stdpath.Join(dst, sub)
-	objs, err := fs.List(ctx, reqPath, args)
-	if err != nil {
-		return nil, err
+// listPaths resolves one mount path and returns the converted objects plus the
+// number of configured sources that failed to list.
+//
+// That count is the whole reason this is not inlined into List. Upstream drops
+// per-source errors on the floor, which is harmless when the result only feeds a
+// directory listing in a browser. Here the result also decides what gets
+// deleted from disk, and a source that is merely rate-limited must never be
+// mistaken for a source that no longer has the file.
+func (c *scanConfig) listPaths(ctx context.Context, path string, refresh bool) ([]model.Obj, int, error) {
+	if utils.PathEqual(path, "/") && !c.autoFlatten {
+		return c.listRoot(), 0, nil
 	}
-	return d.convert2strmObjs(ctx, reqPath, objs), nil
+	root, sub := c.getRootAndPath(path)
+	dsts, ok := c.pathMap[root]
+	if !ok {
+		return nil, 0, errs.ObjectNotFound
+	}
+
+	var objs []model.Obj
+	failed := 0
+	args := &fs.ListArgs{NoLog: true, Refresh: refresh}
+	for _, dst := range dsts {
+		reqPath := stdpath.Join(dst, sub)
+		tmp, err := fs.List(ctx, reqPath, args)
+		if err != nil {
+			failed++
+			continue
+		}
+		objs = append(objs, c.convert2strmObjs(ctx, reqPath, tmp)...)
+	}
+	return objs, failed, nil
 }
 
 // convert2strmObjs turns a source listing into the objects this driver exposes:
@@ -69,7 +99,7 @@ func (d *StrmSync) list(ctx context.Context, dst, sub string, args *fs.ListArgs)
 //
 // Note for callers: directory entries come back with an empty Path. Walk the
 // tree by joining names onto the mount path, never by reading obj.GetPath().
-func (d *StrmSync) convert2strmObjs(ctx context.Context, reqPath string, objs []model.Obj) []model.Obj {
+func (c *scanConfig) convert2strmObjs(ctx context.Context, reqPath string, objs []model.Obj) []model.Obj {
 	var validObjs []model.Obj
 	for _, obj := range objs {
 		id, name, path := "", obj.GetName(), ""
@@ -78,15 +108,15 @@ func (d *StrmSync) convert2strmObjs(ctx context.Context, reqPath string, objs []
 			path = stdpath.Join(reqPath, obj.GetName())
 			sourceExt := utils.SourceExt(name)
 			ext := strings.ToLower(sourceExt)
-			if _, ok := d.downloadSuffix[ext]; ok {
+			if _, ok := c.downloadSuffix[ext]; ok {
 				size = obj.GetSize()
-			} else if _, ok := d.supportSuffix[ext]; ok {
-				if d.minSizeBytes > 0 && obj.GetSize() < d.minSizeBytes {
+			} else if _, ok := c.supportSuffix[ext]; ok {
+				if c.minSizeBytes > 0 && obj.GetSize() < c.minSizeBytes {
 					continue
 				}
 				id = "strm"
 				name = strings.TrimSuffix(name, sourceExt) + "strm"
-				size = int64(len(d.getLink(ctx, path)))
+				size = int64(len(c.getLink(ctx, path)))
 			} else {
 				continue
 			}
@@ -115,28 +145,28 @@ func (d *StrmSync) convert2strmObjs(ctx context.Context, reqPath string, objs []
 // getLink builds the strm file body. It is pure string work -- sign.Sign is a
 // local HMAC -- so generating a strm costs no network at all.
 //
-// SiteUrl is required by this driver precisely because of the fallback below:
+// siteUrl is required by this driver precisely because of the fallback below:
 // a scheduled scan has no HTTP request in its context, so common.GetApiUrl
 // would return "" and every generated strm would lose its host prefix.
-func (d *StrmSync) getLink(ctx context.Context, path string) string {
+func (c *scanConfig) getLink(ctx context.Context, path string) string {
 	finalPath := path
-	if d.EncodePath {
+	if c.encodePath {
 		finalPath = utils.EncodePath(path, true)
 	}
-	if d.WithSign {
+	if c.withSign {
 		signPath := sign.Sign(path)
 		finalPath = fmt.Sprintf("%s?sign=%s", finalPath, signPath)
 	}
-	if len(d.PathPrefix) > 0 {
-		finalPath = stdpath.Join(d.PathPrefix, finalPath)
+	if len(c.pathPrefix) > 0 {
+		finalPath = stdpath.Join(c.pathPrefix, finalPath)
 	}
 	if !strings.HasPrefix(finalPath, "/") {
 		finalPath = "/" + finalPath
 	}
-	if d.WithoutUrl {
+	if c.withoutUrl {
 		return finalPath
 	}
-	apiUrl := d.SiteUrl
+	apiUrl := c.siteUrl
 	if len(apiUrl) > 0 {
 		apiUrl = strings.TrimSuffix(apiUrl, "/")
 	} else {
@@ -145,7 +175,7 @@ func (d *StrmSync) getLink(ctx context.Context, path string) string {
 	return apiUrl + finalPath
 }
 
-func (d *StrmSync) link(ctx context.Context, reqPath string, args model.LinkArgs) (*model.Link, model.Obj, error) {
+func linkTo(ctx context.Context, reqPath string, args model.LinkArgs) (*model.Link, model.Obj, error) {
 	storage, reqActualPath, err := op.GetStorageAndActualPath(reqPath)
 	if err != nil {
 		return nil, nil, err

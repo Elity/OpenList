@@ -32,14 +32,12 @@ const (
 	maxScanDepth = 64
 
 	// scanExitTimeout bounds how long Drop waits for a cancelled pass to
-	// unwind. Cancellation is observed immediately, so hitting this means
-	// something is structurally wrong rather than merely slow.
+	// unwind. Giving up is safe rather than merely tolerable: a pass works
+	// against the immutable scanConfig it started with, so one that outlives
+	// its Drop keeps using the old settings and cannot be corrupted by the
+	// Init that follows.
 	scanExitTimeout = 2 * time.Second
 )
-
-// errDeleteBudgetExhausted aborts the whole pass. Anything else that goes wrong
-// in one directory is recorded and the siblings carry on.
-var errDeleteBudgetExhausted = errors.New("delete budget exhausted")
 
 type scanStats struct {
 	scannedDirs int
@@ -57,68 +55,72 @@ type scanStats struct {
 // Known limitation, covered by the pass budget rather than by these rules: a
 // small directory whose listing comes back under entirely different names is
 // still deleted, because three entries is far below any useful cap.
-func checkDeletion(d *StrmSync, remoteCount, localCount, pending int) (skip bool, reason string) {
-	if d.DisableDeleteProtect {
+func checkDeletion(cfg *scanConfig, remoteCount, localCount, pending int) (skip bool, reason string) {
+	if cfg.disableDeleteProtect {
 		return false, ""
 	}
 	if remoteCount == 0 && localCount > 0 {
 		return true, fmt.Sprintf("remote listing is empty while %d local entries exist", localCount)
 	}
-	if limit := d.maxDeletePerDir(); pending > limit {
+	if limit := cfg.maxDeletePerDir(); pending > limit {
 		return true, fmt.Sprintf("deletion batch of %d exceeds the per-directory cap of %d", pending, limit)
 	}
 	return false, ""
 }
 
-// maxDeletePerDir is the configured cap, or the default when it is unset.
-func (d *StrmSync) maxDeletePerDir() int {
-	if d.MaxDeletePerDir > 0 {
-		return d.MaxDeletePerDir
-	}
-	return defaultMaxDeletePerDir
-}
-
 // reserveDeleteBudget draws from what one pass is allowed to delete in total.
-//
-// Outside a pass there is no budget: browsing a directory is a deliberate user
-// action. Inside a pass the budget is what keeps many individually plausible
-// deletions from adding up to a wiped library.
-func (d *StrmSync) reserveDeleteBudget(n int) (ok bool, reason string) {
-	if d.DisableDeleteProtect || !d.scanning.Load() {
-		return true, ""
+// It is what keeps many individually plausible deletions from adding up to a
+// wiped library when a source misbehaves for a whole pass.
+func (d *StrmSync) reserveDeleteBudget(cfg *scanConfig, n int) bool {
+	if cfg.disableDeleteProtect {
+		return true
 	}
-	if remaining := d.deleteBudget.Add(-int64(n)); remaining < 0 {
-		return false, fmt.Sprintf("pass exhausted its deletion budget by %d entries", -remaining)
-	}
-	return true, ""
+	return d.deleteBudget.Add(-int64(n)) >= 0
 }
 
-func (d *StrmSync) passDeleteBudget() int64 {
-	return int64(d.maxDeletePerDir()) * deleteBudgetFactor
+func (d *StrmSync) refundDeleteBudget(cfg *scanConfig, n int) {
+	if cfg.disableDeleteProtect || n <= 0 {
+		return
+	}
+	d.deleteBudget.Add(int64(n))
 }
 
-// startScan wires up the periodic scan. Called at the end of Init.
-func (d *StrmSync) startScan() {
+func passDeleteBudget(cfg *scanConfig) int64 {
+	return int64(cfg.maxDeletePerDir()) * deleteBudgetFactor
+}
+
+// startScan wires up the periodic scan, replacing any scheduler already
+// installed on this driver. It returns the context governing the new one, so a
+// caller can tell when that scheduler is gone.
+func (d *StrmSync) startScan(cfg *scanConfig) context.Context {
+	// Stop whatever a previous call left running. op invokes Drop and Init on
+	// the same pointer without holding a lock (internal/op/storage.go:204/249/272
+	// and the bare goroutine in server/handles/storage.go:196), so two racing
+	// updates can both find the handles already taken and nil. Without this the
+	// losing side's cron ticks forever against a storage nobody can stop, and
+	// goes on writing to disk after the storage has been disabled.
+	d.stopScan()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	var lim *rate.Limiter
-	if d.ScanRateLimitPerSec > 0 {
-		lim = rate.NewLimiter(rate.Limit(d.ScanRateLimitPerSec), 1)
+	if cfg.scanRate > 0 {
+		lim = rate.NewLimiter(rate.Limit(cfg.scanRate), 1)
 	}
 
 	d.scanMu.Lock()
-	d.scanCtx, d.scanCancel = ctx, cancel
-	if d.ScanIntervalMinutes > 0 {
-		c := cron.NewCron(time.Duration(d.ScanIntervalMinutes) * time.Minute)
+	d.scanCancel = cancel
+	if cfg.scanInterval > 0 {
+		c := cron.NewCron(cfg.scanInterval)
 		// The callback has to return immediately. pkg/cron.Stop sends on an
 		// unbuffered channel that is only received between ticks, so a callback
 		// running for minutes blocks Stop -- and Drop, which calls Stop, runs
 		// synchronously inside the storage HTTP handlers.
-		c.Do(func() { d.spawnScan(ctx, lim, "cron") })
+		c.Do(func() { d.spawnScan(ctx, cfg, lim, "cron") })
 		d.cron = c
 	}
 	d.scanMu.Unlock()
 
-	if d.ScanOnInit {
+	if cfg.scanOnInit {
 		go func() {
 			// Storages load serially at boot; scanning before the source
 			// storage is up makes every path fail with StorageNotFound.
@@ -127,20 +129,24 @@ func (d *StrmSync) startScan() {
 			case <-ctx.Done():
 				return
 			}
-			d.spawnScan(ctx, lim, "init")
+			d.spawnScan(ctx, cfg, lim, "init")
 		}()
 	}
+	return ctx
 }
 
-// stopScan is called at the start of Drop.
+// stopScan is called at the start of Drop, and by startScan before it installs
+// a replacement.
 func (d *StrmSync) stopScan() {
 	// Take the handles under the lock and clear them. internal/op/storage.go
 	// serialises nothing, so two concurrent Drops on the same pointer are
-	// reachable; stopping pkg/cron twice panics with "send on closed channel",
-	// and the load_all goroutine in server/handles/storage.go has no recover.
+	// reachable. Sequential Stop calls on pkg/cron are safe, but concurrent
+	// ones are not: both can miss the closed channel and one then sends on it,
+	// panicking with "send on closed channel" inside the load_all goroutine in
+	// server/handles/storage.go, which has no recover.
 	d.scanMu.Lock()
 	cancel, c := d.scanCancel, d.cron
-	d.scanCancel, d.scanCtx, d.cron = nil, nil, nil
+	d.scanCancel, d.cron = nil, nil
 	d.scanMu.Unlock()
 
 	if cancel != nil {
@@ -152,14 +158,14 @@ func (d *StrmSync) stopScan() {
 	d.awaitScanExit()
 }
 
-// awaitScanExit blocks until an in-flight pass has returned, so the Init that
-// follows a Drop can rebuild pathMap without racing a walk that still reads it.
+// awaitScanExit gives an in-flight pass a moment to notice the cancellation, so
+// the common case leaves nothing running behind a Drop.
 func (d *StrmSync) awaitScanExit() {
 	deadline := time.Now().Add(scanExitTimeout)
 	for d.scanning.Load() {
 		if time.Now().After(deadline) {
-			log.Errorf("[strm-sync] mount=%s pass did not unwind within %s; leaving it running",
-				d.MountPath, scanExitTimeout)
+			log.Warnf("[strm-sync] a pass did not unwind within %s; it will finish against its own configuration snapshot",
+				scanExitTimeout)
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -170,25 +176,26 @@ func (d *StrmSync) awaitScanExit() {
 // hands the work off. Claiming it inside the new goroutine instead would let
 // Drop observe "no pass running" for a pass that is about to start, which is
 // exactly the window awaitScanExit exists to close.
-func (d *StrmSync) spawnScan(ctx context.Context, lim *rate.Limiter, reason string) {
+func (d *StrmSync) spawnScan(ctx context.Context, cfg *scanConfig, lim *rate.Limiter, reason string) {
 	if utils.IsCanceled(ctx) {
 		return
 	}
 	if !d.scanning.CompareAndSwap(false, true) {
-		log.Infof("[strm-sync] mount=%s reason=%s skipped: previous pass still running", d.MountPath, reason)
+		log.Infof("[strm-sync] mount=%s reason=%s skipped: previous pass still running", cfg.mountPath, reason)
 		return
 	}
-	d.deleteBudget.Store(d.passDeleteBudget())
-	go d.runScan(ctx, lim, reason)
+	d.deleteBudget.Store(passDeleteBudget(cfg))
+	d.deletionsOff.Store(false)
+	go d.runScan(ctx, cfg, lim, reason)
 }
 
-func (d *StrmSync) runScan(ctx context.Context, lim *rate.Limiter, reason string) {
+func (d *StrmSync) runScan(ctx context.Context, cfg *scanConfig, lim *rate.Limiter, reason string) {
 	defer d.scanning.Store(false)
 	defer func() {
 		// An unrecovered panic here would take the whole process down:
 		// op.initStorage's recover does not cover goroutines we spawn.
 		if r := recover(); r != nil {
-			log.Errorf("[strm-sync] mount=%s panicked: %v", d.MountPath, r)
+			log.Errorf("[strm-sync] mount=%s panicked: %v", cfg.mountPath, r)
 		}
 	}()
 
@@ -196,22 +203,21 @@ func (d *StrmSync) runScan(ctx context.Context, lim *rate.Limiter, reason string
 	before := d.counters()
 	st := &scanStats{}
 
-	err := d.walk(ctx, "/", 0, d.listMount, lim, st)
+	err := d.walk(ctx, cfg, "/", 0, d.listMount(cfg), lim, st)
 
 	after := d.counters()
 	log.Infof("[strm-sync] mount=%s reason=%s duration=%s scanned_dirs=%d skipped_dirs=%d failed_dirs=%d "+
-		"listed_objs=%d strm_written=%d deleted_files=%d deleted_dirs=%d delete_blocked=%d",
-		d.MountPath, reason, time.Since(start).Truncate(time.Second),
+		"listed_objs=%d strm_written=%d deleted_files=%d deleted_dirs=%d delete_blocked=%d deletions_off=%v",
+		cfg.mountPath, reason, time.Since(start).Truncate(time.Second),
 		st.scannedDirs, st.skippedDirs, st.failedDirs, st.listedObjs,
 		after.written-before.written, after.filesDeleted-before.filesDeleted,
-		after.dirsDeleted-before.dirsDeleted, after.deleteBlocked-before.deleteBlocked)
+		after.dirsDeleted-before.dirsDeleted, after.deleteBlocked-before.deleteBlocked,
+		d.deletionsOff.Load())
 
 	switch {
 	case err == nil, errors.Is(err, context.Canceled):
-	case errors.Is(err, errDeleteBudgetExhausted):
-		log.Errorf("[strm-sync] mount=%s reason=%s aborted: %v", d.MountPath, reason, err)
 	default:
-		log.Errorf("[strm-sync] mount=%s reason=%s ended early: %v", d.MountPath, reason, err)
+		log.Errorf("[strm-sync] mount=%s reason=%s ended early: %v", cfg.mountPath, reason, err)
 	}
 }
 
@@ -222,8 +228,20 @@ func (d *StrmSync) runScan(ctx context.Context, lim *rate.Limiter, reason string
 // pass vacuously.
 type listFn func(ctx context.Context, mountPath string) ([]model.Obj, error)
 
-func (d *StrmSync) listMount(ctx context.Context, mountPath string) ([]model.Obj, error) {
-	return d.List(ctx, &model.Object{Path: mountPath, IsFolder: true}, model.ListArgs{Refresh: true})
+// listMount is the production seam. It reports an error when any configured
+// source failed, which is what stops a rate-limited source from being read as
+// "the file is gone" by the deletion pass.
+func (d *StrmSync) listMount(cfg *scanConfig) listFn {
+	return func(ctx context.Context, mountPath string) ([]model.Obj, error) {
+		objs, failed, err := cfg.listPaths(ctx, mountPath, true)
+		if err != nil {
+			return nil, err
+		}
+		if failed > 0 {
+			return nil, fmt.Errorf("%d of the configured sources failed to list", failed)
+		}
+		return objs, nil
+	}
 }
 
 // walk lists one mount directory, writes it out, then descends. Returning an
@@ -231,32 +249,32 @@ func (d *StrmSync) listMount(ctx context.Context, mountPath string) ([]model.Obj
 //
 // Directory entries from convert2strmObjs carry an empty Path, so children are
 // addressed by joining names onto the mount path rather than by obj.GetPath().
-func (d *StrmSync) walk(ctx context.Context, mountPath string, depth int, list listFn, lim *rate.Limiter, st *scanStats) error {
+func (d *StrmSync) walk(ctx context.Context, cfg *scanConfig, mountPath string, depth int, list listFn, lim *rate.Limiter, st *scanStats) error {
 	if utils.IsCanceled(ctx) {
 		return ctx.Err()
 	}
 	if depth > maxScanDepth {
 		st.skippedDirs++
-		log.Warnf("[strm-sync] mount=%s path=%s exceeded the depth limit of %d", d.MountPath, mountPath, maxScanDepth)
+		log.Warnf("[strm-sync] mount=%s path=%s exceeded the depth limit of %d", cfg.mountPath, mountPath, maxScanDepth)
 		return nil
 	}
 
 	objs, err := list(ctx, mountPath)
 	if err != nil {
 		st.failedDirs++
-		log.Warnf("[strm-sync] mount=%s path=%s failed to list: %v", d.MountPath, mountPath, err)
+		log.Warnf("[strm-sync] mount=%s path=%s failed to list: %v", cfg.mountPath, mountPath, err)
 		return nil
 	}
 	st.scannedDirs++
 	st.listedObjs += len(objs)
 
-	if err := d.writeLocal(ctx, mountPath, objs); err != nil {
+	if err := d.writeLocal(ctx, cfg, mountPath, objs, depth > 0); err != nil {
 		return err
 	}
 
 	// Collect child names and drop the objs before recursing: otherwise every
 	// ancestor's full listing stays pinned on the stack for the whole descent.
-	childNames := childDirNames(objs, st, d.MountPath, mountPath)
+	childNames := childDirNames(objs, st, cfg.mountPath, mountPath)
 	objs = nil
 
 	for _, name := range childNames {
@@ -268,11 +286,18 @@ func (d *StrmSync) walk(ctx context.Context, mountPath string, depth int, list l
 		if utils.IsCanceled(ctx) {
 			return ctx.Err()
 		}
-		if err := d.walk(ctx, stdpath.Join(mountPath, name), depth+1, list, lim, st); err != nil {
+		if err := d.walk(ctx, cfg, stdpath.Join(mountPath, name), depth+1, list, lim, st); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// safeLocalName rejects names that would not stay inside the directory they
+// were listed in. filepath.Join cleans "..", so without this a crafted or
+// mis-decoded name escapes localPath entirely.
+func safeLocalName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`)
 }
 
 // childDirNames picks the sub-directories worth descending into. A source that
@@ -285,7 +310,7 @@ func childDirNames(objs []model.Obj, st *scanStats, mount, mountPath string) []s
 			continue
 		}
 		name := obj.GetName()
-		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		if !safeLocalName(name) {
 			st.skippedDirs++
 			log.Warnf("[strm-sync] mount=%s path=%s skipped a child with an unusable name %q", mount, mountPath, name)
 			continue
