@@ -133,6 +133,25 @@ theoretical: re-keying the dictionary from `LocalMode` to `localMode` left every
 chunk exactly the same length, so nothing about the response would have
 suggested it had changed.
 
+### The other bundle patch
+
+The same script fixes an upstream papercut that has nothing to do with this
+driver. `AddOrEdit.tsx` calls `back()` — `navigate(-1)` — after a successful
+save, assuming browser history's previous entry is the storage list. Reach the
+edit page any other way (a bookmark, a reload, the redirect straight after
+logging in) and saving lands you on whatever *was* there, usually `/@login`,
+with the storage saved and the session still valid. The patch points that one
+call at the storage list.
+
+It lives here because it is the only place this fork can reach the frontend.
+Unlike the dictionary, it is cosmetic, so a bundle that no longer matches warns
+instead of failing the build — check whether upstream fixed it and drop the
+patch.
+
+`scripts/fork_inject_i18n_test.py` covers both transformations against fixtures
+lifted verbatim from a shipped bundle, and `Dockerfile.fork` runs it before the
+frontend is even downloaded.
+
 ## Relationship to upstream
 
 `util.go` and the `Get`/`List`/`Link` bodies in `driver.go` are adapted from

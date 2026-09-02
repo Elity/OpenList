@@ -19,12 +19,18 @@ COPY ./ ./
 # compiles in one step, leaving nowhere to touch the bundle in between. Split
 # it: fetch, patch, compile.
 #
+# The injector's own tests run first. Both of its patches are anchored on
+# minifier output, so the failure mode when upstream rebuilds the frontend is a
+# silently unpatched bundle; the tests at least keep the transformations
+# themselves honest.
+#
 # The compile reuses build.sh's own $ldflags rather than restating them, so the
 # version and commit baked into the binary stay whatever upstream decided they
 # should be. Sourcing with no arguments prints the usage text and defines the
 # variables without building anything; the guard turns a renamed variable into a
 # failed build instead of a binary that reports its version as "unknown".
-RUN bash build.sh release web \
+RUN python3 scripts/fork_inject_i18n_test.py \
+ && bash build.sh release web \
  && python3 scripts/fork_inject_i18n.py public/dist drivers/strm_sync/i18n.json \
  && bash -c '. ./build.sh >/dev/null 2>&1 || true; \
       test -n "$ldflags" || { echo "build.sh no longer defines ldflags"; exit 1; }; \

@@ -37,3 +37,6 @@ output/
 
 .VSCodeCounter
 *.syso
+# Python bytecode from scripts/
+__pycache__/
+*.pyc
