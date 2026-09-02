@@ -175,19 +175,43 @@ func ManifestJSON(c *gin.Context) {
 	}
 }
 
+// FORK-ONLY. Upstream serves every static folder with `max-age=15552000` and
+// no validator, which is correct for it: Vite names each chunk after a hash of
+// its own contents, so a URL under /assets/ really is immutable.
+//
+// This fork breaks that. scripts/fork_inject_i18n.py rewrites chunks after the
+// frontend has been built, so /assets/ filenames no longer describe what they
+// contain -- two releases can serve different bytes at the same URL. Six months
+// of unconditional caching then means a patched bundle never reaches a browser
+// that has been here before, which is exactly how a corrected translation
+// shipped twice without anybody seeing it.
+//
+// Renaming the patched chunks instead was tried and was worse: their importers
+// are not patched, so they keep their own cached URLs and go on requesting
+// chunks that no longer exist. See the note in fork_inject_i18n.py.
+//
+// So /assets/ gets a short freshness window and the folders we never touch keep
+// upstream's. Five minutes costs a handful of conditional-less refetches on a
+// LAN and bounds how long a stale bundle can survive a deploy.
+func assetCacheControl(folder string) string {
+	if folder == "assets" {
+		return "public, max-age=300"
+	}
+	return "public, max-age=15552000"
+}
+
 func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	utils.Log.Debug("Setting up static routes...")
 	siteConfig := getSiteConfig()
 	initStatic()
 	initIndex(siteConfig)
 	folders := []string{"assets", "images", "streamer", "static"}
-
 	if conf.Conf.Cdn == "" {
 		utils.Log.Debug("Setting up static file serving...")
 		r.Use(func(c *gin.Context) {
 			for _, folder := range folders {
 				if strings.HasPrefix(c.Request.RequestURI, fmt.Sprintf("/%s/", folder)) {
-					c.Header("Cache-Control", "public, max-age=15552000")
+					c.Header("Cache-Control", assetCacheControl(folder))
 				}
 			}
 		})

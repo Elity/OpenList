@@ -32,15 +32,26 @@ Two edits, both to files we do not build and cannot otherwise influence:
    a papercut rather than a correctness fix, so losing the anchor warns instead
    of failing the build.
 
-Every chunk touched is renamed and its importers repointed. Vite hashes those
-filenames over *upstream's* build, and the dist is served with
-`Cache-Control: max-age=15552000` and no validator, so a patch applied
-afterwards would otherwise ship under a URL browsers already have cached.
+Chunks are patched **in place**. An earlier version renamed each patched chunk
+and rewrote the references, on the theory that a chunk whose content changed
+needs a new URL to escape `Cache-Control: max-age=15552000`. That was wrong in
+a way worth recording: the importers -- `store-*.js`, `manage-*.js` -- are not
+themselves patched, so they keep their names while their contents change, and a
+browser holding a cached importer goes on requesting a chunk that no longer
+exists. The SPA fallback answers with `index.html`, an ES module import of
+`text/html` fails, and the dictionary loader throws. Renaming produced a blank
+page precisely when the content changed, which is the only time it was supposed
+to do anything. Fixing it properly means cascading new names up the import
+graph to something uncached, which for this bundle is most of the dist.
+
+So the names stay, and `server/static/static.go` no longer claims `/assets/` is
+immutable -- see the comment there. Patching after the build is what forfeits
+the content-addressed filename; the honest response is to stop advertising a
+guarantee we broke, not to invent a second hashing scheme on top.
 
 Usage: fork_inject_i18n.py <dist-dir> <i18n-json>
 """
 
-import hashlib
 import json
 import pathlib
 import re
@@ -109,9 +120,23 @@ def patch_save_navigation(text):
     if sections != {SECTION}:
         found = ", ".join(sorted(sections)) or "none"
         return text, 0, f"not the {SECTION} editor (edit routes: {found})"
-    router = ROUTER_DESTRUCTURE.search(text)
-    if router is None:
+
+    # The back binding is read from one place and the call is rewritten
+    # somewhere else in the file; nothing guarantees they are the same
+    # function. In today's chunk there is exactly one of each. If a future
+    # bundle merges two editors into one chunk there would be two, the first
+    # would be picked arbitrarily, and the rewritten call could name a binding
+    # that is not in scope at that point -- valid syntax, ReferenceError at
+    # runtime. Refuse rather than guess.
+    routers = list(ROUTER_DESTRUCTURE.finditer(text))
+    if not routers:
         return text, 0, "no useRouter() destructuring binds back:"
+    if len(routers) > 1:
+        return text, 0, (
+            f"{len(routers)} useRouter() destructurings in one chunk; "
+            "cannot tell which back() the save handler calls"
+        )
+    router = routers[0]
     to = re.search(r"\bto:(\w+)\b", router.group(0))
     if to is None:
         return text, 0, "the useRouter() destructuring binds back: but not to:"
@@ -124,52 +149,24 @@ def patch_save_navigation(text):
     return patched, count, None
 
 
-def rehash(path):
-    """Give a patched chunk a name that reflects what is now inside it.
+def inject_dictionary(text, translations):
+    """Splice the StrmSync dictionary in front of upstream's Strm one.
 
-    Not cosmetic: correcting the dictionary keys from `LocalMode` to
-    `localMode` changed only the case of leading letters, which left every
-    chunk byte-for-byte the same length. Without a new URL the fix reached
-    nobody who had already opened the page.
-
-    Returns the new basename; the caller rewrites the references.
+    Returns (text, language, reason-it-did-nothing).
     """
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
-    return f"{path.stem}.sy{digest}{path.suffix}"
-
-
-def repoint(dist, renames):
-    """Point every reference in the dist at the renamed chunks.
-
-    A chunk basename is a long unique token, so a plain string replacement is
-    safe and catches the SystemJS loader's legacy references as well as the
-    module graph's. Sourcemap filenames embed the chunk name, so they follow
-    from the same substitution.
-    """
-    edits = {old: 0 for old in renames}
-    for path in sorted(dist.rglob("*")):
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="surrogateescape")
-        except (UnicodeDecodeError, OSError):
-            continue
-        patched = text
-        for old, new in renames.items():
-            if old in patched:
-                edits[old] += patched.count(old)
-                patched = patched.replace(old, new)
-        if patched != text:
-            path.write_text(patched, encoding="utf-8", errors="surrogateescape")
-
-    for old, count in edits.items():
-        if count == 0:
-            raise SystemExit(
-                f"error: nothing in the dist refers to {old!r}.\n"
-                "The chunk was renamed to bust the cache, but no importer was "
-                "found to point at the new name, so the app would 404 on it."
-            )
-    return edits
+    if "StrmSync:{" in text:
+        return text, None, "dictionary already patched"
+    if ANCHOR not in text:
+        return text, None, None  # not a dictionary chunk; nothing to say
+    lang = detect_language(text)
+    if lang is None:
+        return text, None, "language not recognised"
+    entries = translations.get(lang)
+    if entries is None:
+        return text, None, f"no translations for {lang}"
+    # Exactly one replacement: a chunk carries a second `Strm:{` inside a map of
+    # per-driver alerts, and a StrmSync key spliced in there is dead weight.
+    return text.replace(ANCHOR, dictionary_for(entries) + ANCHOR, 1), lang, None
 
 
 def main(argv=None):
@@ -181,26 +178,20 @@ def main(argv=None):
     translations = json.loads(i18n_path.read_text(encoding="utf-8"))
     translations.pop("_comment", None)
 
-    dictionaries, navigation, skipped, touched = [], [], [], []
+    # Nothing is written until every chunk has been considered. An earlier
+    # version wrote as it went and then bailed out on a missing anchor, which
+    # left the navigation patch on disk under its original name and a rerun
+    # reporting that it had not been applied.
+    planned, dictionaries, navigation, skipped = {}, [], [], []
     for path in sorted(dist.rglob("*.js")):
         if not path.is_file():
             continue
         original = path.read_text(encoding="utf-8", errors="surrogateescape")
         text = original
 
-        if "StrmSync:{" in text:
-            skipped.append(f"{path.name}: dictionary already patched")
-        elif ANCHOR in text:
-            lang = detect_language(text)
-            if lang is None:
-                skipped.append(f"{path.name}: language not recognised")
-            elif translations.get(lang) is None:
-                skipped.append(f"{path.name}: no translations for {lang}")
-            else:
-                # Exactly one replacement: the anchor opens one object per chunk.
-                text = text.replace(ANCHOR, dictionary_for(translations[lang]) + ANCHOR, 1)
-                dictionaries.append(f"{path.name} ({lang})")
-
+        # Navigation first. The scope check reads every `/@manage/<x>/edit/` in
+        # the chunk, and a translation containing one would otherwise be able
+        # to veto the patch.
         if SAVE_SUCCESS_CALL in text:
             text, count, reason = patch_save_navigation(text)
             if count:
@@ -208,9 +199,14 @@ def main(argv=None):
             else:
                 skipped.append(f"{path.name}: save navigation untouched -- {reason}")
 
+        text, lang, reason = inject_dictionary(text, translations)
+        if lang:
+            dictionaries.append(f"{path.name} ({lang})")
+        elif reason:
+            skipped.append(f"{path.name}: {reason}")
+
         if text != original:
-            path.write_text(text, encoding="utf-8", errors="surrogateescape")
-            touched.append(path)
+            planned[path] = text
 
     for line in dictionaries:
         print(f"  dictionary {line}")
@@ -221,10 +217,11 @@ def main(argv=None):
 
     if not dictionaries:
         print(
-            f"error: no chunk under {dist} contained {ANCHOR!r}.\n"
-            "The frontend bundle no longer looks the way this script expects, so the\n"
-            "StrmSync form would ship with untranslated placeholders. Re-check the\n"
-            "layout of the driver dictionary in the dist and update ANCHOR.",
+            f"error: no chunk under {dist} took the StrmSync dictionary.\n"
+            "Either the bundle no longer looks the way this script expects, or it\n"
+            "has already been patched -- check the skip lines above. Nothing has\n"
+            "been written; the StrmSync form would otherwise ship with\n"
+            "untranslated placeholders.",
             file=sys.stderr,
         )
         return 1
@@ -236,14 +233,9 @@ def main(argv=None):
             file=sys.stderr,
         )
 
-    renames = {}
-    for path in touched:
-        renamed = rehash(path)
-        path.rename(path.with_name(renamed))
-        renames[path.name] = renamed
-    edits = repoint(dist, renames)
-
-    print(f"repointed {sum(edits.values())} reference(s) to {len(renames)} renamed chunk(s)")
+    for path, text in planned.items():
+        path.write_text(text, encoding="utf-8", errors="surrogateescape")
+    print(f"patched {len(planned)} chunk(s) in place")
     return 0
 
 

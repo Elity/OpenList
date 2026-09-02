@@ -125,13 +125,26 @@ into the downloaded dist during the image build, which is why the fork uses
 `Dockerfile.fork`. If the bundle layout ever changes the script exits non-zero
 and the build fails, rather than quietly shipping the placeholders again.
 
-The script also renames each chunk it patches and repoints the importers at the
-new name. Vite hashes those filenames over *upstream's* output, and the dist is
-served with `max-age=15552000` and no validator, so a patch applied afterwards
-would otherwise ship under a URL browsers already have cached. That is not
-theoretical: re-keying the dictionary from `LocalMode` to `localMode` left every
-chunk exactly the same length, so nothing about the response would have
-suggested it had changed.
+The script also has to fight the cache. Upstream serves `/assets/` with
+`max-age=15552000` and no validator, which is sound for upstream because Vite
+names each chunk after a hash of its contents. Patching after the build forfeits
+that: two releases can serve different bytes at the same URL, and a corrected
+bundle never reaches a browser that has been here before.
+
+Renaming the patched chunks was the first attempt and it was worse than the
+problem. The importers — `store-*.js`, `manage-*.js` — are not themselves
+patched, so they keep their own cached URLs while their contents change, and a
+returning browser goes on requesting a chunk that no longer exists. The SPA
+fallback answers with `index.html`, an ES module import of `text/html` throws,
+and the dictionary loader takes the whole page down. It manufactured a blank
+page exactly when the content changed, which is the only time it did anything at
+all. Doing it properly means cascading new names up the import graph to
+something uncached, which here is most of the dist.
+
+So chunks are patched in place and `server/static/static.go` stops advertising
+`/assets/` as immutable — five minutes instead of six months, with the other
+static folders left on upstream's setting. `static_fork_test.go` keeps a rebase
+from silently restoring it.
 
 ### The other bundle patch
 
