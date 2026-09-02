@@ -23,12 +23,12 @@ type Addition struct {
 	Paths   string `json:"paths" required:"true" type:"text" help:"One source path per line"`
 	SiteUrl string `json:"siteUrl" required:"false" type:"text" help:"URL prefix written into the strm files, e.g. https://pan.example.com. Required unless withoutUrl is set: a scheduled scan has no request to derive it from"`
 
-	PathPrefix      string `json:"pathPrefix" type:"text" required:"false" default:"/d"`
+	PathPrefix      string `json:"pathPrefix" type:"text" required:"false" default:"/d" help:"Prefix in front of the path, /d for a signed download link"`
 	FilterFileTypes string `json:"filterFileTypes" type:"text" required:"false" default:"mp4,mkv,flv,avi,wmv,ts,rmvb,webm,mp3,flac,aac,wav,ogg,m4a,wma,alac" help:"Media suffixes that become strm files"`
 	MinFileSize     int64  `json:"minFileSize" type:"number" required:"false" default:"0" help:"Skip files smaller than this (MB, 0 to disable)"`
-	EncodePath      bool   `json:"encodePath" required:"false" default:"true"`
-	WithoutUrl      bool   `json:"withoutUrl" required:"false" default:"false"`
-	WithSign        bool   `json:"withSign" required:"false" default:"false"`
+	EncodePath      bool   `json:"encodePath" required:"false" default:"true" help:"Percent-encode the path written into the strm files"`
+	WithoutUrl      bool   `json:"withoutUrl" required:"false" default:"false" help:"Write only the path, without the site URL"`
+	WithSign        bool   `json:"withSign" required:"false" default:"false" help:"Append ?sign=, required if the site is not publicly readable"`
 
 	LocalPath string `json:"localPath" required:"true" type:"text" help:"Directory the strm tree is written to"`
 	LocalMode string `json:"localMode" type:"select" options:"insert,update,sync" default:"insert" help:"insert: never touch existing files. update: rewrite changed ones. sync: also delete files this storage generated that are gone upstream"`
@@ -36,9 +36,9 @@ type Addition struct {
 	// One switch per attachment kind. All false means nothing extra is fetched,
 	// which is the safe default: every attachment costs a real getDownloadUrl
 	// call, and on Aliyun those are limited to 0.9/s and shared with playback.
-	DownloadSubtitle   bool   `json:"downloadSubtitle" required:"false" default:"false"`
-	DownloadImage      bool   `json:"downloadImage" required:"false" default:"false"`
-	DownloadNfo        bool   `json:"downloadNfo" required:"false" default:"false"`
+	DownloadSubtitle   bool   `json:"downloadSubtitle" required:"false" default:"false" help:"Download ass, srt, vtt, sub, ssa, smi, idx"`
+	DownloadImage      bool   `json:"downloadImage" required:"false" default:"false" help:"Download jpg, jpeg, png, webp, bmp, tbn"`
+	DownloadNfo        bool   `json:"downloadNfo" required:"false" default:"false" help:"Download nfo files that live next to the media"`
 	DownloadExtraTypes string `json:"downloadExtraTypes" type:"text" required:"false" default:"" help:"Extra suffixes to download alongside the strm files"`
 
 	ScanIntervalMinutes int     `json:"scanIntervalMinutes" type:"number" required:"false" default:"0" help:"Full scan interval in minutes, 0 to disable"`

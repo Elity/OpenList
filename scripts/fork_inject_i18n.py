@@ -2,10 +2,18 @@
 """Splice the StrmSync driver translations into a downloaded frontend bundle.
 
 OpenList's web UI does not render the `help:` text the backend sends with each
-driver field. It looks labels and tips up in a dictionary compiled into the
-frontend JS, keyed by driver name and Go field name, and falls back to printing
-the raw key -- so a driver the frontend has never heard of shows `LocalMode` as
-its label and `LocalMode-tips` as its help text.
+driver field. It uses it only as a flag -- the tips row is
+`<Show when={field.help}>` -- and looks the text itself up in a dictionary
+compiled into the frontend JS, keyed by driver name and JSON tag:
+
+    label    drivers.StrmSync.<json tag>
+    tips     drivers.StrmSync.<json tag>-tips
+    option   drivers.StrmSync.<json tag>s.<option>
+
+A key that misses is reported nowhere; the translator capitalises the last path
+segment instead, so an unknown driver shows `LocalMode` as its label and
+`LocalMode-tips` as its help text. `drivers/strm_sync/i18n_test.go` checks the
+JSON against the struct, which is what keeps those keys honest.
 
 Our driver does not exist upstream and so can never be in that bundle. Forking
 OpenList-Frontend to add three JSON entries would mean maintaining a second fork

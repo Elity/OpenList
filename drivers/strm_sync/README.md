@@ -102,19 +102,28 @@ structural and cannot be turned off.
 ## Web UI labels
 
 The UI does not render the `help:` text the backend sends with each field. It
-looks labels and tips up in a dictionary compiled into the frontend bundle, keyed
-by driver name and Go field name, and prints the raw key when there is no entry —
-so an un-translated driver shows `LocalMode` as its label and `LocalMode-tips` as
-its help text.
+uses it only as a flag — the tips row is `<Show when={field.help}>`, so a field
+with no `help:` tag gets no tip at all — and looks the text itself up in a
+dictionary compiled into the frontend bundle:
+
+| | key |
+|---|---|
+| label | `drivers.StrmSync.<json tag>` |
+| tips | `drivers.StrmSync.<json tag>-tips` |
+| select option | `drivers.StrmSync.<json tag>s.<option>` |
+
+**Keys are the JSON tags, not the Go field names.** A key that misses is
+reported nowhere: the translator capitalises the last path segment instead, so
+`drivers.StrmSync.localMode` renders as `LocalMode` — close enough to a real
+label that the first version of `i18n.json` shipped keyed by field name and
+nobody noticed until the form was on screen. `i18n_test.go` checks the JSON
+against the struct so that cannot happen twice.
 
 This driver does not exist upstream and so can never be in that bundle.
 `i18n.json` holds its translations and `scripts/fork_inject_i18n.py` splices them
 into the downloaded dist during the image build, which is why the fork uses
 `Dockerfile.fork`. If the bundle layout ever changes the script exits non-zero
 and the build fails, rather than quietly shipping the placeholders again.
-
-Field keys are Go struct field names, not JSON tags, and a `select` field also
-takes a `<Field>s` object for its options.
 
 ## Relationship to upstream
 
