@@ -1,0 +1,56 @@
+### Fork-only image. Identical to Dockerfile except that the frontend bundle is
+### patched with the StrmSync translations before it is embedded.
+###
+### A separate file rather than an edit to Dockerfile: a path upstream does not
+### have can never produce a rebase conflict, and upstream's own image keeps
+### building unchanged.
+ARG BASE_IMAGE_TAG=base
+
+FROM alpine:edge AS builder
+LABEL stage=go-builder
+WORKDIR /app/
+# python3 on top of upstream's list, for scripts/fork_inject_i18n.py.
+RUN apk add --no-cache bash curl jq gcc git go musl-dev python3
+COPY go.mod go.sum ./
+RUN go mod download
+COPY ./ ./
+
+# Upstream runs `build.sh release docker`, which fetches the frontend and then
+# compiles in one step, leaving nowhere to touch the bundle in between. Split
+# it: fetch, patch, compile.
+#
+# The compile reuses build.sh's own $ldflags rather than restating them, so the
+# version and commit baked into the binary stay whatever upstream decided they
+# should be. Sourcing with no arguments prints the usage text and defines the
+# variables without building anything; the guard turns a renamed variable into a
+# failed build instead of a binary that reports its version as "unknown".
+RUN bash build.sh release web \
+ && python3 scripts/fork_inject_i18n.py public/dist drivers/strm_sync/i18n.json \
+ && bash -c '. ./build.sh >/dev/null 2>&1 || true; \
+      test -n "$ldflags" || { echo "build.sh no longer defines ldflags"; exit 1; }; \
+      go build -o ./bin/openlist -ldflags="$ldflags" -tags=jsoniter .'
+
+FROM openlistteam/openlist-base-image:${BASE_IMAGE_TAG}
+LABEL MAINTAINER="OpenList"
+ARG INSTALL_FFMPEG=false
+ARG INSTALL_ARIA2=false
+ARG USER=openlist
+ARG UID=1001
+ARG GID=1001
+
+WORKDIR /opt/openlist/
+
+RUN addgroup -g ${GID} ${USER} && \
+    adduser -D -u ${UID} -G ${USER} ${USER} && \
+    mkdir -p /opt/openlist/data
+
+COPY --from=builder --chmod=755 --chown=${UID}:${GID} /app/bin/openlist ./
+COPY --chmod=755 --chown=${UID}:${GID} entrypoint.sh /entrypoint.sh
+
+USER ${USER}
+RUN /entrypoint.sh version
+
+ENV UMASK=022 RUN_ARIA2=${INSTALL_ARIA2}
+VOLUME /opt/openlist/data/
+EXPOSE 5244 5245
+CMD [ "/entrypoint.sh" ]

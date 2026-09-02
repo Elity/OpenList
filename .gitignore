@@ -22,6 +22,9 @@ output/
 # vendor/
 /bin/*
 *.json
+# Fork: driver translations spliced into the frontend bundle at image build
+# time. Tracked deliberately -- the image build fails without it.
+!/drivers/strm_sync/i18n.json
 !renovate.json
 /build
 /data/

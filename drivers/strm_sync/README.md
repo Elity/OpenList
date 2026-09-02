@@ -99,6 +99,23 @@ structural and cannot be turned off.
   rewrite it on the next pass. Linux filesystems are unaffected; SMB shares and
   HFS+ are not.
 
+## Web UI labels
+
+The UI does not render the `help:` text the backend sends with each field. It
+looks labels and tips up in a dictionary compiled into the frontend bundle, keyed
+by driver name and Go field name, and prints the raw key when there is no entry —
+so an un-translated driver shows `LocalMode` as its label and `LocalMode-tips` as
+its help text.
+
+This driver does not exist upstream and so can never be in that bundle.
+`i18n.json` holds its translations and `scripts/fork_inject_i18n.py` splices them
+into the downloaded dist during the image build, which is why the fork uses
+`Dockerfile.fork`. If the bundle layout ever changes the script exits non-zero
+and the build fails, rather than quietly shipping the placeholders again.
+
+Field keys are Go struct field names, not JSON tags, and a `select` field also
+takes a `<Field>s` object for its options.
+
 ## Relationship to upstream
 
 `util.go` and the `Get`/`List`/`Link` bodies in `driver.go` are adapted from

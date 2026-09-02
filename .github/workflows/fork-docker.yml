@@ -10,6 +10,8 @@ name: Fork Docker Image
 #   - GHCR only; upstream also pushes Docker Hub, which needs a secret a fork
 #     does not have and whose login step has no fork guard
 #   - self-contained Dockerfile instead of Dockerfile.ci, so there is no
+#   - patches the frontend bundle with the StrmSync translations, which the
+#     upstream image has no reason to carry
 #     cross-compile + artifact-passing stage to replicate
 #
 # The frontend comes from upstream for free: build.sh defaults FRONTEND_REPO to
@@ -76,7 +78,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.fork
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
