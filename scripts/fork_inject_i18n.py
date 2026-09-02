@@ -29,6 +29,7 @@ build fails rather than quietly shipping the placeholders again.
 Usage: fork_inject_i18n.py <dist-dir> <i18n-json>
 """
 
+import hashlib
 import json
 import pathlib
 import re
@@ -70,6 +71,57 @@ def detect_language(text):
     return None
 
 
+def rehash(path):
+    """Rename a patched chunk so its URL reflects what is now inside it.
+
+    Vite names these chunks after a hash of *upstream's* build output, and the
+    dist is served with `Cache-Control: max-age=15552000` and no validator. A
+    patch applied afterwards therefore ships under a URL a browser already has
+    cached, and the fix reaches nobody who has opened the page before -- which
+    is not hypothetical: correcting the dictionary keys from `LocalMode` to
+    `localMode` left every chunk byte-for-byte the same length, so not even the
+    Content-Length gave it away.
+
+    Returns the new basename. The caller rewrites the references.
+    """
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:8]
+    return f"{path.stem}.sy{digest}{path.suffix}"
+
+
+def repoint(dist, renames):
+    """Point every reference in the dist at the renamed chunks.
+
+    A chunk basename is a long unique token, so a plain string replacement is
+    safe and catches the SystemJS loader's legacy references as well as the
+    module graph's. Sourcemap filenames embed the chunk name, so they follow
+    from the same substitution.
+    """
+    edits = {old: 0 for old in renames}
+    for path in sorted(dist.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        except (UnicodeDecodeError, OSError):
+            continue
+        patched = text
+        for old, new in renames.items():
+            if old in patched:
+                edits[old] += patched.count(old)
+                patched = patched.replace(old, new)
+        if patched != text:
+            path.write_text(patched, encoding="utf-8", errors="surrogateescape")
+
+    for old, count in edits.items():
+        if count == 0:
+            raise SystemExit(
+                f"error: nothing in the dist refers to {old!r}.\n"
+                "The chunk was renamed to bust the cache, but no importer was "
+                "found to point at the new name, so the app would 404 on it."
+            )
+    return edits
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -78,7 +130,7 @@ def main():
     translations = json.loads(i18n_path.read_text(encoding="utf-8"))
     translations.pop("_comment", None)
 
-    patched, skipped = [], []
+    patched, skipped, renames = [], [], {}
     for path in sorted(dist.rglob("*.js")):
         if not path.is_file():
             continue
@@ -101,7 +153,11 @@ def main():
         # Exactly one replacement: the anchor opens one object per chunk.
         text = text.replace(ANCHOR, dictionary_for(entries) + ANCHOR, 1)
         path.write_text(text, encoding="utf-8", errors="surrogateescape")
-        patched.append(f"{path.name} ({lang})")
+
+        renamed = rehash(path)
+        path.rename(path.with_name(renamed))
+        renames[path.name] = renamed
+        patched.append(f"{path.name} ({lang}) -> {renamed}")
 
     for line in patched:
         print(f"  patched {line}")
@@ -117,6 +173,9 @@ def main():
             file=sys.stderr,
         )
         return 1
+
+    edits = repoint(dist, renames)
+    print(f"repointed {sum(edits.values())} reference(s) to the renamed chunks")
     print(f"injected StrmSync translations into {len(patched)} chunk(s)")
     return 0
 

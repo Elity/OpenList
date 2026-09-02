@@ -125,6 +125,14 @@ into the downloaded dist during the image build, which is why the fork uses
 `Dockerfile.fork`. If the bundle layout ever changes the script exits non-zero
 and the build fails, rather than quietly shipping the placeholders again.
 
+The script also renames each chunk it patches and repoints the importers at the
+new name. Vite hashes those filenames over *upstream's* output, and the dist is
+served with `max-age=15552000` and no validator, so a patch applied afterwards
+would otherwise ship under a URL browsers already have cached. That is not
+theoretical: re-keying the dictionary from `LocalMode` to `localMode` left every
+chunk exactly the same length, so nothing about the response would have
+suggested it had changed.
+
 ## Relationship to upstream
 
 `util.go` and the `Get`/`List`/`Link` bodies in `driver.go` are adapted from
