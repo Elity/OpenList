@@ -7,6 +7,8 @@ minifier output and a hand-written approximation would happily pass while the
 real bundle did not match.
 """
 
+import contextlib
+import io
 import json
 import pathlib
 import shutil
@@ -119,9 +121,62 @@ class SaveNavigationTest(unittest.TestCase):
         self.assertIn("back()", reason)
 
     def test_the_dictionary_chunk_is_out_of_scope_entirely(self):
-        patched, count, _ = inject.patch_save_navigation(ENTRY_CHUNK)
+        patched, count, reason = inject.patch_save_navigation(ENTRY_CHUNK)
         self.assertEqual(count, 0)
         self.assertEqual(patched, ENTRY_CHUNK)
+        # Assert *why*: without this the test passes under a build that has
+        # lost the section check, because some later guard rejects it anyway.
+        self.assertIn("not the storages editor", reason)
+
+    def test_a_manage_route_without_edit_does_not_widen_the_scope(self):
+        """`/@manage/messenger` rides in the storages chunk and has no
+        `/edit/`. Only edit routes may decide which editor a chunk is, or the
+        storages patch silently stops applying to the storages chunk."""
+        text = ADD_OR_EDIT + "u(`/@manage/messenger`);"
+        patched, count, reason = inject.patch_save_navigation(text)
+        self.assertIsNone(reason)
+        self.assertEqual(count, 1)
+        self.assertIn("`global.save_success`)),o(`/@manage/storages`)", patched)
+
+    def test_only_the_back_binding_is_rewritten_not_any_call(self):
+        """The call rewritten has to be back(). Upstream reordering the handler
+        so some other nullary call follows save_success must abort the patch,
+        not silently redirect that call to the storage list."""
+        text = ADD_OR_EDIT.replace("`global.save_success`)),i()", "`global.save_success`)),p()")
+        patched, count, reason = inject.patch_save_navigation(text)
+        self.assertEqual(count, 0)
+        self.assertEqual(patched, text)
+        self.assertIn("back()", reason)
+
+    def test_a_to_binding_from_a_different_object_is_not_borrowed(self):
+        """back: and to: must come out of the same destructuring. Pairing a
+        back from one object with a to from another rewrites the call to a
+        binding that need not be in scope at the call site."""
+        text = (
+            "let {params:r,back:i}=k(),{to:o}=j();"
+            "x.success(t(`global.save_success`)),i();"
+            "o(`/@manage/storages/edit/${e}`)"
+        )
+        patched, count, reason = inject.patch_save_navigation(text)
+        self.assertEqual(count, 0)
+        self.assertEqual(patched, text)
+        self.assertIn("to:", reason)
+
+    def test_the_dictionary_literal_closes_with_a_comma(self):
+        """It is spliced in front of an existing key, so without the trailing
+        comma the chunk is a syntax error and the whole bundle fails to parse
+        -- while still containing the `StrmSync:{` that a laxer test looks
+        for."""
+        self.assertEqual(
+            inject.dictionary_for({"paths": "源路径"}), 'StrmSync:{"paths":`源路径`},'
+        )
+
+    def test_a_translation_that_looks_like_javascript_is_escaped(self):
+        """Values land inside a template literal, so a backtick ends the string
+        and `${` starts an interpolation."""
+        self.assertEqual(inject.js_literal("a`b"), "`a\\`b`")
+        self.assertEqual(inject.js_literal("${x}"), "`\\${x}`")
+        self.assertEqual(inject.js_literal("a\\b"), "`a\\\\b`")
 
 
 class InjectionTest(unittest.TestCase):
@@ -176,6 +231,103 @@ class InjectionTest(unittest.TestCase):
         )
         self.assertIn("o(`/@manage/storages`)", addoredit.read_text(encoding="utf-8"))
 
+    def test_the_dictionary_lands_beside_the_upstream_driver_not_inside_it(self):
+        """Placement is the entire patch. One brace off and the keys land at
+        `drivers.Strm.StrmSync.*`, which nothing ever looks up; one comma off
+        and the chunk does not parse. Both still contain `StrmSync:{`, which is
+        all the assertion above checks."""
+        self.assertEqual(self.run_injector(), 0)
+        entry = next(p for p in (self.dist / "assets").iterdir() if p.name.startswith("entry-AAA."))
+        text = entry.read_text(encoding="utf-8")
+        self.assertIn('drivers:{Local:{},StrmSync:{"paths":`源路径`', text)
+        self.assertIn("},Strm:{PathPrefix:", text)
+        self.assertNotIn("Strm:{StrmSync:", text)
+
+    def test_references_from_non_js_files_are_repointed_too(self):
+        """index.html and modulepreload hints name chunks directly and are
+        served with the same 180-day cache header. Today's dist happens to
+        reference only chunks we do not touch, so nothing downstream would
+        catch this regressing."""
+        (self.dist / "index.html").write_text(
+            '<script type="module" src="/assets/entry-AAA.js"></script>'
+            '<link rel="modulepreload" href="/assets/AddOrEdit-BBB.js">',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_injector(), 0)
+        html = (self.dist / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("/assets/entry-AAA.js", html)
+        self.assertNotIn("/assets/AddOrEdit-BBB.js", html)
+        names = self.assets()
+        self.assertIn(next(n for n in names if n.startswith("entry-AAA.")), html)
+        self.assertIn(next(n for n in names if n.startswith("AddOrEdit-BBB.")), html)
+
+    def test_running_the_injector_twice_does_not_stack_a_second_dictionary(self):
+        """`StrmSync:{` does not contain `Strm:{`, so an already-patched chunk
+        still matches the anchor. Only the already-patched check stops the
+        second run from splicing a duplicate in front of it."""
+        self.assertEqual(self.run_injector(), 0)
+        self.run_injector()
+        entry = next(p for p in (self.dist / "assets").iterdir() if p.name.startswith("entry-AAA."))
+        self.assertEqual(entry.read_text(encoding="utf-8").count("StrmSync:{"), 1)
+
+    def test_only_the_first_anchor_in_a_chunk_takes_the_dictionary(self):
+        """One driver dictionary per chunk. The real chunks carry a second
+        `Strm:{` inside a map of per-driver alerts; a StrmSync key spliced in
+        there is at best dead weight."""
+        (self.dist / "assets" / "entry-AAA.js").write_text(
+            ENTRY_CHUNK + ENTRY_CHUNK, encoding="utf-8"
+        )
+        self.assertEqual(self.run_injector(), 0)
+        entry = next(p for p in (self.dist / "assets").iterdir() if p.name.startswith("entry-AAA."))
+        self.assertEqual(entry.read_text(encoding="utf-8").count("StrmSync:{"), 1)
+
+    def test_each_language_chunk_gets_the_dictionary_for_its_own_language(self):
+        """Three languages ship, and the probes are the only thing deciding
+        which chunk is which. A chunk handed the wrong one is not detectable
+        anywhere downstream: the keys all resolve, just in the wrong script."""
+        self.i18n.write_text(
+            json.dumps(
+                {
+                    "en": {"paths": "Source paths"},
+                    "zh-CN": {"paths": "源路径"},
+                    "zh-TW": {"paths": "來源路徑"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        chunk = "var y={drivers:{Strm:{PathPrefix:`%s`,paths:`%s`}}};export{y};"
+        (self.dist / "assets" / "lang-EN.js").write_text(
+            chunk % ("PathPrefix", "Paths"), encoding="utf-8"
+        )
+        (self.dist / "assets" / "lang-TW.js").write_text(
+            chunk % ("路徑前綴", "路徑"), encoding="utf-8"
+        )
+        (self.dist / "assets" / "manage-CCC.js").write_text(
+            'import("./entry-AAA.js");import("./AddOrEdit-BBB.js");'
+            'import("./lang-EN.js");import("./lang-TW.js");',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_injector(), 0)
+        assets = list((self.dist / "assets").iterdir())
+        en = next(p for p in assets if p.name.startswith("lang-EN."))
+        tw = next(p for p in assets if p.name.startswith("lang-TW."))
+        self.assertIn("`Source paths`", en.read_text(encoding="utf-8"))
+        self.assertIn("`來源路徑`", tw.read_text(encoding="utf-8"))
+
+    def test_the_rehashed_name_is_derived_from_the_patched_contents(self):
+        """The rename exists to bust a 180-day cache. A name that does not move
+        with the contents busts nothing on the second patch -- which is the
+        exact bug the rename was added to fix."""
+        one, two = self.tmp / "one", self.tmp / "two"
+        one.mkdir()
+        two.mkdir()
+        (one / "entry-AAA.js").write_text("var x=1;", encoding="utf-8")
+        (two / "entry-AAA.js").write_text("var x=2;", encoding="utf-8")
+        first = inject.rehash(one / "entry-AAA.js")
+        second = inject.rehash(two / "entry-AAA.js")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("entry-AAA.sy") and first.endswith(".js"), first)
+
     def test_a_dist_with_no_dictionary_fails_the_build(self):
         (self.dist / "assets" / "entry-AAA.js").write_text("var x={};", encoding="utf-8")
         self.assertEqual(self.run_injector(), 1)
@@ -186,10 +338,16 @@ class InjectionTest(unittest.TestCase):
             self.run_injector()
 
     def test_a_bundle_that_lost_the_save_handler_only_warns(self):
-        """The navigation fix is a papercut, not a correctness fix. Losing the
-        anchor should not stop the image from building."""
+        """The navigation fix is a papercut, not a correctness fix, so losing
+        the anchor must not stop the image from building -- but exiting 0 is
+        only half the contract. A silent success here is a fork that quietly
+        stopped applying the patch."""
         (self.dist / "assets" / "AddOrEdit-BBB.js").write_text("var z=()=>{};", encoding="utf-8")
-        self.assertEqual(self.run_injector(), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.run_injector(), 0)
+        self.assertIn("warning:", err.getvalue())
+        self.assertIn("no chunk was patched", err.getvalue())
 
 
 if __name__ == "__main__":
